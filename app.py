@@ -76,17 +76,28 @@ results = []
 # --- THE ENGINE ---
 # --- INSIDE THE LOOP (for ticker in tickers:) ---
 with st.spinner("Scanning Markets..."):
-    for ticker in tickers:
-        data = get_data(ticker)
-        if data:
-            df_d, df_m15 = data
+    import time
+
+# ... inside your ticker loop ...
+for ticker in tickers:
+    try:
+        tk = yf.Ticker(ticker)
+        # 1. Add a small sleep to avoid Rate Limit
+        time.sleep(2) 
+        
+        # 2. Safely check for options
+        if tk.options:
+            expiry = tk.options[0]
+            opts = tk.option_chain(expiry)
+            # ... (rest of your Greeks logic here) ...
+        else:
+            greeks = {"Delta": "N/A", "Theta": "N/A"}
             
-            # Indicator Calculations
-            close = float(df_d['Close'].iloc[-1])
-            sma200 = df_d['Close'].rolling(window=200).mean().iloc[-1]
-            rsi = float(calculate_rsi(df_m15['Close']).iloc[-1])
-            avg_vol = df_d['Volume'].rolling(window=10).mean().iloc[-1]
-            curr_vol = float(df_d['Volume'].iloc[-1])
+    except Exception as e:
+        # If one stock fails (like AAPL did in your log), 
+        # the app will keep moving to the next stock instead of crashing.
+        st.warning(f"Could not fetch Greeks for {ticker}. Using defaults.")
+        greeks = {"Delta": "N/A", "Theta": "N/A"}
             
             # Trend and Volume Status
             trend = "Bullish" if close > sma200 else "Bearish"
