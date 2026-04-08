@@ -6,7 +6,13 @@ import time
 from datetime import datetime, timedelta
 from scipy.stats import norm
 from streamlit_autorefresh import st_autorefresh
+import requests
 
+# Create a custom session to bypass basic bot detection
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+})
 # --- 1. APP CONFIGURATION & SECURITY ---
 st.set_page_config(page_title="Mag 7 Live Monitor", layout="wide")
 
