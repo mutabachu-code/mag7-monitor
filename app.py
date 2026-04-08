@@ -7,7 +7,23 @@ from datetime import datetime, timedelta
 from scipy.stats import norm
 from streamlit_autorefresh import st_autorefresh
 import requests
+import json
 
+def save_data_for_bot(results):
+    # Determine the overall market state based on Mag 7 average
+    bullish_count = sum(1 for r in results if r["Trend"] == "Bullish")
+    high_vol_count = sum(1 for r in results if r["Volume"] == "✅ High")
+    avg_prob = sum(float(r["Prob %"].replace('%','')) for r in results) / len(results)
+    
+    status_data = {
+        "MarketBias": "Bullish" if bullish_count >= 4 else "Bearish",
+        "VolumeState": "High" if high_vol_count >= 4 else "Low",
+        "GammaState": "High" if any(float(r["Gamma"]) > 0.01 for r in results) else "Low",
+        "Probability": avg_prob
+    }
+    
+    with open("market_status.json", "w") as f:
+        json.dump(status_data, f)
 # Create a custom session to bypass basic bot detection
 session = requests.Session()
 session.headers.update({
