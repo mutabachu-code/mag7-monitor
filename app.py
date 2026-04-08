@@ -123,11 +123,10 @@ with st.spinner("Fetching Market Data & Greeks..."):
             results.append({
                 "Ticker": ticker,
                 "Price": f"${close:.2f}",
-                "Trend": trend,
-                "RSI (15m)": f"{rsi:.1f}",
                 "Delta": greeks["Delta"],
+                "Gamma": greeks["Gamma"], # New Column
+                "Prob %": greeks["Prob %"], # New Column
                 "Theta": greeks["Theta"],
-                "Volume": vol_status,
                 "Signal": status,
                 "Target (+2%)": target_display
             })
