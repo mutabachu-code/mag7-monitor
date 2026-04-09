@@ -1,3 +1,2 @@
 yfinance
 pandas-ta
-numpy==1.26.4
