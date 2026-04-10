@@ -70,35 +70,58 @@ results = []
 # Progress bar for data fetching
 progress = st.progress(0)
 
+# --- CORE LOGIC UPDATE ---
+
 for i, ticker in enumerate(tickers):
     try:
+        # 1. Download data
         data = yf.download(ticker, period="1y", interval="1d")
-        # Technicals
+        
+        # 2. Calculate Technicals
         data['SMA200'] = ta.sma(data['Close'], length=200)
         data['RSI'] = ta.rsi(data['Close'], length=14)
         
+        # 3. FIXED EXTRACTION: Using .iloc[-1] to get single values
         close = float(data['Close'].iloc[-1])
         sma200 = float(data['SMA200'].iloc[-1])
         rsi = float(data['RSI'].iloc[-1])
         
-        # Volume Analysis
+        # 4. Volume Analysis
         avg_vol = data['Volume'].tail(20).mean()
-        curr_vol = data['Volume'].iloc[-1]
+        curr_vol = float(data['Volume'].iloc[-1])
         vol_status = "✅ High" if curr_vol > avg_vol else "❌ Low"
         
-        # Trend
         trend = "Bullish" if close > sma200 else "Bearish"
-        
-        # Entry Levels (Support/Resistance)
         support, resistance = get_pivot_levels(data)
         
-        # Mock Greeks (Replace with your actual Greeks logic here)
-        prob = np.random.randint(40, 95) # Placeholder for your Greeks Probability %
-        gamma = round(np.random.uniform(0.001, 0.02), 4) # Placeholder
-        
-        # Final Consolidated Signal
+        # Replace these with your actual Greeks logic
+        prob = np.random.randint(40, 95) 
         final_sig = generate_consensus_signal(rsi, trend, vol_status, prob)
         
+        results.append({
+            "Ticker": ticker,
+            "Price": f"${close:.2f}",
+            "SMA200": trend,
+            "RSI": round(rsi, 1),
+            "Vol": vol_status,
+            "Prob %": prob,
+            "Entry Floor": f"${support}",
+            "Ceiling": f"${resistance}",
+            "FINAL SIGNAL": final_sig
+        })
+        
+    except Exception as e:
+        st.error(f"Error fetching {ticker}: {e}")
+
+# --- FIXED TABLE DISPLAY ---
+df_results = pd.DataFrame(results)
+
+# Changed applymap to map (newer pandas version fix)
+def color_signal(val):
+    color = 'green' if 'BUY' in val else ('red' if 'SELL' in val else 'white')
+    return f'color: {color}; font-weight: bold'
+
+st.table(df_results.style.map(color_signal, subset=['FINAL SIGNAL']))
         results.append({
             "Ticker": ticker,
             "Price": f"${close:.2f}",
