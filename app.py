@@ -69,37 +69,29 @@ for i, ticker in enumerate(tickers):
     try:
         # 1. Download data (progress=False prevents extra logs)
         data = yf.download(ticker, period="1y", interval="1d", progress=False)
-        
         if not data.empty:
             # 2. Calculate Indicators
             data['SMA200'] = ta.sma(data['Close'], length=200)
             data['RSI'] = ta.rsi(data['Close'], length=14)
-            
             # 3. CRITICAL FIX: Extract single float values using .iloc[-1]
             # We use .values[0] or .iloc[-1] to ensure we don't grab a Series
             close = float(data['Close'].iloc[-1])
             sma200_val = data['SMA200'].iloc[-1]
             rsi_val = data['RSI'].iloc[-1]
-
             # Handle potential NaN values in technical indicators
             sma200 = float(sma200_val) if pd.notnull(sma200_val) else 0.0
-            rsi = float(rsi_val) if pd.notnull(rsi_val) else 50.0
-            
+            rsi = float(rsi_val) if pd.notnull(rsi_val) else 50.
             # 4. Volume Analysis
             avg_vol = data['Volume'].tail(20).mean()
             curr_vol = float(data['Volume'].iloc[-1])
-            vol_status = "✅ High" if curr_vol > avg_vol else "❌ Low"
-            
+            vol_status = "✅ High" if curr_vol > avg_vol else "❌ Low
             # 5. Trend & Pivot Levels
             trend = "Bullish" if close > sma200 else "Bearish"
             support, resistance = get_pivot_levels(data)
-            
             # 6. Sentiment Probability (Simulation)
-            prob = np.random.randint(45, 95) 
-            
+            prob = np.random.randint(45, 95)  
             # 7. Final Signal Generation
-            final_sig = generate_consensus_signal(rsi, trend, vol_status, prob)
-            
+            final_sig = generate_consensus_signal(rsi, trend, vol_status, prob 
             # 8. Data Storage
             results.append({
                 "Ticker": ticker,
