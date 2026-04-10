@@ -67,7 +67,7 @@ progress_bar = st.progress(0)
 
 for i, ticker in enumerate(tickers):
     try:
-        # 1. Download data with silent progress
+        # 1. Download data (progress=False prevents extra logs)
         data = yf.download(ticker, period="1y", interval="1d", progress=False)
         
         if not data.empty:
@@ -75,10 +75,15 @@ for i, ticker in enumerate(tickers):
             data['SMA200'] = ta.sma(data['Close'], length=200)
             data['RSI'] = ta.rsi(data['Close'], length=14)
             
-            # 3. Secure single values (Fixed the 'Series' vs 'Float' bug)
+            # 3. CRITICAL FIX: Extract single float values using .iloc[-1]
+            # We use .values[0] or .iloc[-1] to ensure we don't grab a Series
             close = float(data['Close'].iloc[-1])
-            sma200 = float(data['SMA200'].iloc[-1])
-            rsi = float(data['RSI'].iloc[-1])
+            sma200_val = data['SMA200'].iloc[-1]
+            rsi_val = data['RSI'].iloc[-1]
+
+            # Handle potential NaN values in technical indicators
+            sma200 = float(sma200_val) if pd.notnull(sma200_val) else 0.0
+            rsi = float(rsi_val) if pd.notnull(rsi_val) else 50.0
             
             # 4. Volume Analysis
             avg_vol = data['Volume'].tail(20).mean()
@@ -89,7 +94,7 @@ for i, ticker in enumerate(tickers):
             trend = "Bullish" if close > sma200 else "Bearish"
             support, resistance = get_pivot_levels(data)
             
-            # 6. Sentiment Probability (Simulating your Greeks logic)
+            # 6. Sentiment Probability (Simulation)
             prob = np.random.randint(45, 95) 
             
             # 7. Final Signal Generation
@@ -97,6 +102,20 @@ for i, ticker in enumerate(tickers):
             
             # 8. Data Storage
             results.append({
+                "Ticker": ticker,
+                "Price": f"${close:.2f}",
+                "SMA200": trend,
+                "RSI": round(rsi, 1),
+                "Vol": vol_status,
+                "Prob %": prob,
+                "Entry Floor": f"${support}",
+                "Ceiling": f"${resistance}",
+                "FINAL SIGNAL": final_sig
+            })
+        
+    except Exception as e:
+        # This will now give you more specific details if something else fails
+        st.error(f"Error fetching {ticker}: {str(e)}")         results.append({
                 "Ticker": ticker,
                 "Price": f"${close:.2f}",
                 "SMA200": trend,
