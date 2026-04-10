@@ -97,8 +97,7 @@ for i, ticker in enumerate(tickers):
         # Replace these with your actual Greeks logic
         prob = np.random.randint(40, 95) 
         final_sig = generate_consensus_signal(rsi, trend, vol_status, prob)
-        
-        results.append({
+         results.append({
             "Ticker": ticker,
             "Price": f"${close:.2f}",
             "SMA200": trend,
