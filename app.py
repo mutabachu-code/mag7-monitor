@@ -27,6 +27,11 @@ for ticker in tickers:
         df = yf.download(ticker, period="1y", interval="1d", progress=False)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+            df = yf.download(ticker, period="1y", interval="1d", progress=False)
+
+# THE FIX: This flattens the data so 'Close' is a single number, not a 'Series'
+if isinstance(df.columns, pd.MultiIndex):
+    df.columns = df.columns.get_level_values(0)
 
         if not df.empty:
             df['SMA200'] = ta.sma(df['Close'], length=200)
