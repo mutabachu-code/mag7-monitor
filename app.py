@@ -1,58 +1,77 @@
-import streamlit as st
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
+from scipy.stats import norm
 from datetime import datetime
 
-# --- SAFE DEPENDENCY CHECK ---
-try:
-    from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(interval=300000, key="datarefresh")
-except ImportError:
-    st.info("🔄 Installing refresh engine... Dashboard will update manually for now.")
+# --- CONFIGURATION ---
+MAG_7 = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA']
+INTERVAL = "5m"  # Options: 1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo
+PERIOD = "1d"    # Lookback period
 
-# --- SETTINGS ---
-st.set_page_config(page_title="Mag 7 Sniper", layout="wide")
+def calculate_rsi(data, window=14):
+    delta = data['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
-# --- CORE LOGIC ---
-tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA"]
-st.title("🎯 Mag 7 Technical Sniper")
-st.subheader(f"Session Status: {datetime.now().strftime('%H:%M EAT')}")
+def get_delta_proxy(S, K, T, r, sigma):
+    """Simplified Black-Scholes Delta for Call Option as a sentiment proxy"""
+    if T <= 0 or sigma <= 0: return 0.5
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    return norm.cdf(d1)
 
-results = []
-for ticker in tickers:
-    try:
-        # Download and fix the MultiIndex 'Series' error immediately
-        df = yf.download(ticker, period="1y", interval="1d", progress=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-            df = yf.download(ticker, period="1y", interval="1d", progress=False)
+def analyze_mag7():
+    print(f"--- Fetching Mag 7 Data (Intraday + Premarket) | {datetime.now().strftime('%H:%M:%S')} ---")
+    results = []
 
-# THE FIX: This flattens the data so 'Close' is a single number, not a 'Series'
-if isinstance(df.columns, pd.MultiIndex):
-    df.columns = df.columns.get_level_values(0)
-
-        if not df.empty:
-            df['SMA200'] = ta.sma(df['Close'], length=200)
-            df['RSI'] = ta.rsi(df['Close'], length=14)
+    for ticker in MAG_7:
+        try:
+            # 1. Fetch Intraday Data (including Pre/Post Market)
+            stock = yf.Ticker(ticker)
+            df = stock.history(period=PERIOD, interval=INTERVAL, prepost=True)
             
-            # Extract values as pure floats to avoid 'Series' errors
-            close = float(df['Close'].iloc[-1])
-            rsi = float(df['RSI'].iloc[-1]) if pd.notnull(df['RSI'].iloc[-1]) else 50.0
-            sma = float(df['SMA200'].iloc[-1]) if pd.notnull(df['SMA200'].iloc[-1]) else 0.0
+            if df.empty: continue
+
+            # 2. Technical Calculations
+            df['RSI'] = calculate_rsi(df)
+            current_price = df['Close'].iloc[-1]
+            last_rsi = df['RSI'].iloc[-1]
+            avg_volume = df['Volume'].tail(10).mean()
+            last_volume = df['Volume'].iloc[-1]
             
+            # 3. Sentiment/Greeks Proxy
+            # We use ATM (At-the-money) strike for sentiment; 0.05 (5%) risk-free rate; 1 day to expiry
+            volatility = df['Close'].pct_change().std() * np.sqrt(252 * (6.5 * 12)) # Annualized intraday vol
+            delta = get_delta_proxy(current_price, current_price, 1/252, 0.05, volatility)
+
+            # 4. Generate Signals
+            signal = "NEUTRAL"
+            if last_rsi < 35 and last_volume > avg_volume:
+                signal = "🚀 BULLISH (Oversold + Vol Spike)"
+            elif last_rsi > 65 and last_volume > avg_volume:
+                signal = "⚠️ BEARISH (Overbought + Vol Spike)"
+            elif delta > 0.55:
+                signal = "📈 MILD BULLISH (Delta Strength)"
+            elif delta < 0.45:
+                signal = "📉 MILD BEARISH (Delta Weakness)"
+
             results.append({
                 "Ticker": ticker,
-                "Price": f"${close:.2f}",
-                "SMA200": "Bullish" if close > sma else "Bearish",
-                "RSI": round(rsi, 1),
-                "Vol": "✅ High" if df['Volume'].iloc[-1] > df['Volume'].tail(20).mean() else "❌ Low",
-                "Prob %": np.random.randint(60, 95),
-                "SIGNAL": "🚀 BUY" if rsi < 45 and close > sma else "⏳ WAIT"
+                "Price": f"${current_price:.2f}",
+                "RSI": round(last_rsi, 2),
+                "Vol/Avg": round(last_volume/avg_volume, 2),
+                "Delta Proxy": round(delta, 2),
+                "Signal": signal
             })
-    except Exception as e:
-        st.error(f"Waiting for {ticker} data...")
 
-if results:
-    st.table(pd.DataFrame(results))
+        except Exception as e:
+            print(f"Error analyzing {ticker}: {e}")
+
+    # Display Results
+    final_df = pd.DataFrame(results)
+    print(final_df.to_string(index=False))
+
+if __name__ == "__main__":
+    analyze_mag7()
