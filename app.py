@@ -1,77 +1,81 @@
+import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.stats import norm
-from datetime import datetime
 
-# --- CONFIGURATION ---
-MAG_7 = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA']
-INTERVAL = "5m"  # Options: 1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo
-PERIOD = "1d"    # Lookback period
+# --- DASHBOARD SETUP ---
+st.set_page_config(page_title="Mag 7 Live Monitor", layout="wide")
+st.title("🛡️ Mag 7 Technical Monitor")
+st.caption("Real-time Intraday Analysis | Premarket | Greeks Proxy")
 
-def calculate_rsi(data, window=14):
-    delta = data['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA']
 
-def get_delta_proxy(S, K, T, r, sigma):
-    """Simplified Black-Scholes Delta for Call Option as a sentiment proxy"""
-    if T <= 0 or sigma <= 0: return 0.5
+def get_bs_delta(S, K, T, r, sigma):
+    """Calculates a theoretical Delta as a sentiment proxy."""
+    if T <= 0 or sigma <= 0 or S <= 0: return 0.5
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     return norm.cdf(d1)
 
-def analyze_mag7():
-    print(f"--- Fetching Mag 7 Data (Intraday + Premarket) | {datetime.now().strftime('%H:%M:%S')} ---")
-    results = []
+def clean_data(df):
+    """Fills missing values to prevent the RuntimeWarnings seen in your logs."""
+    return df.ffill().bfill().dropna()
 
-    for ticker in MAG_7:
-        try:
-            # 1. Fetch Intraday Data (including Pre/Post Market)
-            stock = yf.Ticker(ticker)
-            df = stock.history(period=PERIOD, interval=INTERVAL, prepost=True)
+# Create a refresh button
+if st.button('🔄 Refresh Market Data'):
+    st.rerun()
+
+cols = st.columns(4) # Create a grid for the display
+
+for i, ticker in enumerate(TICKERS):
+    try:
+        stock = yf.Ticker(ticker)
+        # Using 2 days to ensure we have enough data for a stable RSI calculation
+        df = stock.history(period="2d", interval="5m", prepost=True)
+        df = clean_data(df)
+
+        if len(df) < 15:
+            st.warning(f"Not enough data for {ticker}")
+            continue
+
+        # --- TECHNICALS ---
+        # RSI
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        # Current Metrics
+        curr_p = df['Close'].iloc[-1]
+        prev_p = df['Close'].iloc[-2]
+        curr_rsi = rsi.iloc[-1]
+        
+        # Volume Analysis (Prevents the 'round' error from your screenshot)
+        last_vol = df['Volume'].iloc[-1]
+        avg_vol = df['Volume'].tail(10).mean()
+        vol_ratio = round(last_vol / avg_vol, 2) if avg_vol > 0 else 1.0
+        
+        # Greeks Proxy (Annualized Vol)
+        ann_vol = df['Close'].pct_change().std() * np.sqrt(252 * 78)
+        delta_val = get_bs_delta(curr_p, curr_p, 1/252, 0.045, ann_vol)
+
+        # --- UI DISPLAY ---
+        with cols[i % 4]:
+            price_diff = curr_p - prev_p
+            st.metric(label=ticker, value=f"${curr_p:.2f}", delta=f"{price_diff:.2f}")
             
-            if df.empty: continue
+            # Color-coded Sentiment
+            if curr_rsi > 70:
+                st.error(f"RSI: {curr_rsi:.1f} (Overbought)")
+            elif curr_rsi < 30:
+                st.success(f"RSI: {curr_rsi:.1f} (Oversold)")
+            else:
+                st.info(f"RSI: {curr_rsi:.1f}")
 
-            # 2. Technical Calculations
-            df['RSI'] = calculate_rsi(df)
-            current_price = df['Close'].iloc[-1]
-            last_rsi = df['RSI'].iloc[-1]
-            avg_volume = df['Volume'].tail(10).mean()
-            last_volume = df['Volume'].iloc[-1]
-            
-            # 3. Sentiment/Greeks Proxy
-            # We use ATM (At-the-money) strike for sentiment; 0.05 (5%) risk-free rate; 1 day to expiry
-            volatility = df['Close'].pct_change().std() * np.sqrt(252 * (6.5 * 12)) # Annualized intraday vol
-            delta = get_delta_proxy(current_price, current_price, 1/252, 0.05, volatility)
+            st.write(f"**Vol Ratio:** {vol_ratio}x")
+            st.write(f"**Delta Proxy:** {delta_val:.2f}")
+            st.divider()
 
-            # 4. Generate Signals
-            signal = "NEUTRAL"
-            if last_rsi < 35 and last_volume > avg_volume:
-                signal = "🚀 BULLISH (Oversold + Vol Spike)"
-            elif last_rsi > 65 and last_volume > avg_volume:
-                signal = "⚠️ BEARISH (Overbought + Vol Spike)"
-            elif delta > 0.55:
-                signal = "📈 MILD BULLISH (Delta Strength)"
-            elif delta < 0.45:
-                signal = "📉 MILD BEARISH (Delta Weakness)"
-
-            results.append({
-                "Ticker": ticker,
-                "Price": f"${current_price:.2f}",
-                "RSI": round(last_rsi, 2),
-                "Vol/Avg": round(last_volume/avg_volume, 2),
-                "Delta Proxy": round(delta, 2),
-                "Signal": signal
-            })
-
-        except Exception as e:
-            print(f"Error analyzing {ticker}: {e}")
-
-    # Display Results
-    final_df = pd.DataFrame(results)
-    print(final_df.to_string(index=False))
-
-if __name__ == "__main__":
-    analyze_mag7()
+    except Exception as e:
+        st.error(f"Error loading {ticker}: {e}")
