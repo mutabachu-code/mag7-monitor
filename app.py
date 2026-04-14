@@ -59,10 +59,27 @@ for i, ticker in enumerate(TICKERS):
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs)).iloc[-1]
         
-        # C. MTF Volume Analysis (Comparing 5m vol to 1H avg vol)
-        last_vol = df_5m['Volume'].iloc[-1]
-        avg_vol_1h = df_1h['Volume'].tail(20).mean() # Avg volume of last 20 hours
-        vol_ratio = last_vol / (avg_vol_1h / 12) # Normalize 1h vol to a 5m segment
+        # --- MOVING AVERAGE VOLUME ANALYSIS ---
+        # 1. Calculate the 20-period Moving Average of Volume (The Baseline)
+        df_5m['vol_ma_long'] = df_5m['Volume'].rolling(window=20).mean()
+        
+        # 2. Calculate the 5-period Moving Average of Volume (The Current Surge)
+        df_5m['vol_ma_short'] = df_5m['Volume'].rolling(window=5).mean()
+        
+        # 3. Get the latest values
+        current_vma_short = df_5m['vol_ma_short'].iloc[-1]
+        baseline_vma_long = df_5m['vol_ma_long'].iloc[-1]
+        
+        # 4. Calculate Ratio (Relative Volume / RVOL)
+        vol_ratio = current_vma_short / baseline_vma_long if baseline_vma_long > 0 else 1.0
+        
+        # 5. Define Status
+        if vol_ratio > 1.25:
+            vol_status = "Surging 🔥"
+        elif vol_ratio < 0.75:
+            vol_status = "Drying Up 🧊"
+        else:
+            vol_status = "Steady"
         
         # D. The Delta Fix (Using a fixed Strike from start of day to see directional drift)
         start_price = df_5m['Open'].iloc[0]
