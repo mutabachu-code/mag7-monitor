@@ -119,7 +119,7 @@ for i, ticker in enumerate(TICKERS):
             # Detailed Stats
             with st.expander("Technical Details"):
                 st.write(f"RSI (5m): {rsi:.1f}")
-                st.write(f"Vol Score: {vol_ratio:.2f}x")
+                st.write(f"**Vol Surge (RVOL):** {vol_status} ({vol_ratio:.2f}x)")
                 st.write(f"Opt. Delta: {delta_val:.2f}")
                 st.write(f"SMA 200: ${sma200_1h:.2f}")
             st.divider()
