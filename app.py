@@ -29,15 +29,20 @@ for i, ticker in enumerate(TICKERS):
         stock = yf.Ticker(ticker)
         
         # 5-minute data for RSI and current price
-        df_5m = stock.history(period="2d", interval="5m", prepost=True).ffill().bfill()
+        df_5m = stock.history(period="5d", interval="5m", prepost=True).ffill().bfill()
         
-        # 1-hour data for SMA 200 Trend
-        df_1h = stock.history(period="1mo", interval="1h").ffill().bfill()
+        # INCREASED PERIOD: 60 days to ensure 200 hourly bars are available
+        df_1h = stock.history(period="60d", interval="1h").ffill().bfill()
 
-        if len(df_5m) < 20 or len(df_1h) < 200:
-            with cols[i % 4]:
-                st.warning(f"{ticker}: Not enough data for SMA 200")
-            continue
+        # Check if we actually have enough bars for the SMA
+        if len(df_1h) < 200:
+            # Fallback: If 200 is too much for the current API return, 
+            # try to use a 50 SMA or show the data regardless
+            sma_period = 50 if len(df_1h) >= 50 else len(df_1h)
+            sma200_1h = df_1h['Close'].rolling(window=sma_period).mean().iloc[-1]
+            st.info(f"{ticker}: Using SMA {sma_period} (Insufficient data for 200)")
+        else:
+            sma200_1h = df_1h['Close'].rolling(window=200).mean().iloc[-1]
 
         # --- CALCULATIONS ---
         
