@@ -57,17 +57,26 @@ for i, ticker in enumerate(TICKERS):
         ann_vol = df_5m['Close'].pct_change().std() * np.sqrt(252 * 78)
         delta, gamma, vega = get_greeks(curr_p, df_5m['Open'].iloc[0], 1/252, 0.045, ann_vol)
 
-        # --- ADVANCED CONFLUENCE LOGIC ---
-        trend_up = curr_p > sma200
-        macd_cross_up = macd_line.iloc[-1] > signal_line.iloc[-1] and macd_line.iloc[-2] <= signal_line.iloc[-2]
+        # --- FIXED ADVANCED CONFLUENCE LOGIC ---
+        # Using .iloc[-1] and ensuring it's a single value
+        current_macd = float(macd_line.iloc[-1])
+        current_signal = float(signal_line.iloc[-1])
+        prev_macd = float(macd_line.iloc[-2])
+        prev_signal = float(signal_line.iloc[-2])
+
+        trend_up = bool(curr_p > sma200)
+        
+        # Check for crossover: MACD was below signal, now it's above
+        macd_cross_up = (current_macd > current_signal) and (prev_macd <= prev_signal)
+        # Check for cross-down for the warning
+        macd_cross_down = (current_macd < current_signal) and (prev_macd >= prev_signal)
         
         if trend_up and macd_cross_up:
             signal, sig_color = "🚀 INSTITUTIONAL BUY", "green"
-        elif not trend_up and not macd_cross_up:
+        elif not trend_up and macd_cross_down:
             signal, sig_color = "⚠️ CAUTION (Bearish)", "red"
         else:
             signal, sig_color = "⚪ NEUTRAL", "gray"
-
         # --- UI ---
         with cols[i % 4]:
             st.metric(label=ticker, value=f"${curr_p:.2f}", delta=f"Beta: {beta_val:.2f}")
