@@ -30,7 +30,7 @@ cols = st.columns(4)
 
 for i, ticker in enumerate(TICKERS):
     try:
-# --- CALCULATIONS ENGINE (FIXED) ---
+        # --- CALCULATIONS ENGINE (FIXED) ---
         stock = yf.Ticker(ticker)
         df_5m = stock.history(period="5d", interval="5m").ffill().bfill()
         df_1h = stock.history(period="60d", interval="1h").ffill().bfill()
@@ -78,7 +78,8 @@ for i, ticker in enumerate(TICKERS):
         elif not trend_up and macd_cross_down:
             signal, sig_color = "⚠️ CAUTION (Bearish)", "red"
         else:
-            signal, sig_color = "⚪ NEUTRAL", "gray"        # --- UI ---
+            signal, sig_color = "⚪ NEUTRAL", "gray"
+        # --- UI ---
         with cols[i % 4]:
             st.metric(label=ticker, value=f"${curr_p:.2f}", delta=f"Beta: {beta_val:.2f}")
             st.markdown(f"**Action:** :{sig_color}[{signal}]")
