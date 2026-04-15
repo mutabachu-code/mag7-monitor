@@ -4,3 +4,4 @@ pandas-ta
 scipy
 streamlit
 streamlit-autorefresh
+anthropic 
