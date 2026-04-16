@@ -7,18 +7,18 @@ from typing import Optional
 @dataclass
 class TradeSignal:
     ticker: str
-    action: str           # "BUY" | "SELL" | "HOLD"
-    confidence: str       # "HIGH" | "MEDIUM" | "LOW"
+    action: str
+    confidence: str
     entry_price: float
     stop_loss: float
     take_profit: float
-    lot_size: float       # fixed 0.02 for now
+    lot_size: float
     reasoning: str
     sentiment_summary: str
     raw_signal: str
 
 
-_client = ANTHROPIC_API_KEY = "sk-ant-..."
+_client = anthropic.Anthropic()
 
 
 def analyse(
@@ -34,12 +34,8 @@ def analyse(
     account_balance: float = 100.0,
     lot_size: float = 0.02,
 ) -> Optional[TradeSignal]:
-    """
-    Call Claude with full indicator set + web search for news/sentiment/fundamentals.
-    Returns a TradeSignal, or None on failure.
-    """
 
-    prompt = f"""You are a disciplined quantitative trading analyst for Magnificent 7 
+    prompt = f"""You are a disciplined quantitative trading analyst for Magnificent 7
 tech stocks traded as CFDs on a small $100 account via Exness MT5.
 
 === TECHNICAL DATA: {ticker} ===
@@ -55,49 +51,26 @@ Dashboard Signal   : {raw_signal}
 === ACCOUNT & RISK PARAMETERS ===
 Account Balance    : ${account_balance:.2f}
 Lot Size (fixed)   : {lot_size} lots
-Max Risk per Trade : 2% of account (${account_balance * 0.02:.2f})
-Stop Loss Rule     : Place SL at the nearest significant level — the greater of:
-                     (a) 1.0% below entry for BUY / above entry for SELL, OR
-                     (b) below/above the most recent swing high/low based on price context
-Take Profit Rule   : Minimum 2:1 reward-to-risk ratio from entry
+Stop Loss Rule     : 1.0% from entry (BUY: below entry, SELL: above entry)
+Take Profit Rule   : Minimum 2:1 reward-to-risk ratio
 
-=== YOUR FULL ANALYSIS TASK ===
-
-STEP 1 — TECHNICALS
-Confirm whether the technical setup is valid:
-- Price must be clearly above/below SMA200 (trend confirmation)
-- RSI must be oversold (<40) for BUY or overbought (>60) for SELL
-- MACD must align with the trade direction
-- Volume ratio >= 1.1 (participation)
-Only proceed to steps 2-3 if technicals are valid. If not, return HOLD immediately.
-
-STEP 2 — SENTIMENT, NEWS & FUNDAMENTALS
-Search your knowledge for the most recent information on {ticker}:
-- Any significant recent news (earnings, product launches, regulatory issues, guidance)
-- Current market sentiment (analyst ratings, institutional positioning)
-- Relevant macro factors affecting this stock today (Fed policy, sector rotation, 
-  broader Nasdaq trend, any breaking news)
-- Whether the fundamental picture supports or contradicts the technical signal
-
-STEP 3 — FINAL DECISION
-Combine technicals + fundamentals + sentiment into a single decision.
-A technically valid signal should be DOWNGRADED to HOLD if:
-- There is adverse news pending or just released (earnings risk, regulatory scrutiny)
-- Sentiment is strongly against the direction
-- Macro environment contradicts the trade
-Calculate exact SL and TP prices based on the rules above.
+=== YOUR TASK ===
+STEP 1 — Check technicals are valid for a trade.
+STEP 2 — Search for latest news, sentiment, analyst views on {ticker} today.
+STEP 3 — Combine both into a final BUY / SELL / HOLD decision.
+Downgrade to HOLD if adverse news, earnings risk, or macro contradicts the signal.
 
 === RESPONSE FORMAT ===
-Respond ONLY with valid JSON — no markdown, no preamble, no explanation outside the JSON:
+Respond ONLY with a valid JSON object — no markdown, no preamble:
 {{
-  "action": "BUY" | "SELL" | "HOLD",
-  "confidence": "HIGH" | "MEDIUM" | "LOW",
-  "entry_price": <current price as float>,
-  "stop_loss": <absolute price level as float>,
-  "take_profit": <absolute price level as float>,
+  "action": "BUY",
+  "confidence": "HIGH",
+  "entry_price": {current_price:.2f},
+  "stop_loss": 0.0,
+  "take_profit": 0.0,
   "lot_size": {lot_size},
-  "reasoning": "<2-3 sentences: technical setup + key news/sentiment factor that drove the decision>",
-  "sentiment_summary": "<1-2 sentences on the current fundamental/news backdrop for {ticker}>"
+  "reasoning": "2-3 sentences on technicals and key factor driving decision.",
+  "sentiment_summary": "1-2 sentences on current news and fundamental backdrop."
 }}"""
 
     try:
@@ -108,31 +81,58 @@ Respond ONLY with valid JSON — no markdown, no preamble, no explanation outsid
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
         )
 
-        # Collect all text blocks (web search may produce multiple content blocks)
-        raw = "".join(
-            block.text for block in response.content
-            if hasattr(block, "text")
-        ).strip()
+        # Safely extract only text blocks — skip tool_use, tool_result, etc.
+        text_parts = []
+        for block in response.content:
+            # block can be TextBlock, ToolUseBlock, ToolResultBlock — only want text
+            if hasattr(block, "type") and block.type == "text":
+                text_parts.append(block.text)
+            elif isinstance(block, str):
+                text_parts.append(block)
+
+        raw = " ".join(text_parts).strip()
+
+        if not raw:
+            print(f"[claude_analyst] No text content returned for {ticker}")
+            return None
 
         # Strip accidental markdown fences
         raw = re.sub(r"```(?:json)?", "", raw).strip()
 
-        # Extract JSON — find first { ... } block
+        # Extract the first { ... } JSON block
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if not match:
-            raise ValueError(f"No JSON found in response: {raw[:200]}")
+            print(f"[claude_analyst] No JSON found for {ticker}: {raw[:200]}")
+            return None
 
         data = json.loads(match.group())
 
+        # Calculate SL/TP if Claude left them as 0
+        entry = float(data.get("entry_price", current_price))
+        sl    = float(data.get("stop_loss", 0))
+        tp    = float(data.get("take_profit", 0))
+        action = data.get("action", "HOLD")
+
+        if action == "BUY":
+            if sl == 0:
+                sl = round(entry * 0.99, 2)       # 1% below entry
+            if tp == 0:
+                tp = round(entry + 2 * (entry - sl), 2)   # 2:1 R:R
+        elif action == "SELL":
+            if sl == 0:
+                sl = round(entry * 1.01, 2)       # 1% above entry
+            if tp == 0:
+                tp = round(entry - 2 * (sl - entry), 2)   # 2:1 R:R
+
         return TradeSignal(
             ticker=ticker,
-            action=data["action"],
-            confidence=data["confidence"],
-            entry_price=float(data["entry_price"]),
-            stop_loss=float(data["stop_loss"]),
-            take_profit=float(data["take_profit"]),
+            action=action,
+            confidence=data.get("confidence", "LOW"),
+            entry_price=entry,
+            stop_loss=sl,
+            take_profit=tp,
             lot_size=float(data.get("lot_size", lot_size)),
-            reasoning=data["reasoning"],
+            reasoning=data.get("reasoning", ""),
             sentiment_summary=data.get("sentiment_summary", ""),
             raw_signal=raw_signal,
         )
