@@ -1,110 +1,179 @@
 """
-broker.py
----------
-CFD broker integration layer.
-Fill in the API details for your specific broker below.
-Currently a stub — place_order() logs the trade but does NOT execute.
+broker.py  —  Exness MT5 execution layer
+-----------------------------------------
+Connects to a locally running MetaTrader 5 terminal (Windows).
+MT5 must be installed, logged into your Exness account, and have
+"Allow Algo Trading" enabled in Tools > Options > Expert Advisors.
 
-Once you confirm your broker, replace the stub with the real API calls.
+Exness stock CFD symbols: AAPL, MSFT, GOOGL, AMZN, TSLA, META, NVDA
+(confirm exact symbols in your MT5 Market Watch — they may have suffixes
+like AAPLm on some Exness account types)
 """
 
-import requests
 import os
 from dataclasses import dataclass
 from typing import Optional
+
+# MetaTrader5 is Windows-only. On Streamlit Cloud (Linux) we fall back
+# to a stub so the dashboard still renders without crashing.
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    MT5_AVAILABLE = False
+
+
+# ── Exness MT5 credentials — set in Streamlit secrets or .env ────────────────
+MT5_LOGIN    = int(os.getenv("MT5_LOGIN", "0"))
+MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
+MT5_SERVER   = os.getenv("MT5_SERVER", "Exness-MT5Real7")   # check your PA for exact server name
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 @dataclass
 class OrderResult:
     success: bool
-    order_id: Optional[str]
+    order_id: Optional[int]
     message: str
     filled_price: Optional[float] = None
 
 
-# ─────────────────────────────────────────────────────────────
-# BROKER CONFIGURATION
-# Set these in Streamlit secrets or as environment variables.
-# NEVER hardcode credentials here.
-# ─────────────────────────────────────────────────────────────
-BROKER_API_KEY    = os.getenv("BROKER_API_KEY", "")
-BROKER_API_SECRET = os.getenv("BROKER_API_SECRET", "")
-BROKER_BASE_URL   = os.getenv("BROKER_BASE_URL", "https://api.yourbroker.com")
-BROKER_ACCOUNT_ID = os.getenv("BROKER_ACCOUNT_ID", "")
+def _connect() -> bool:
+    """Initialise and authenticate with the MT5 terminal."""
+    if not MT5_AVAILABLE:
+        return False
+    if not mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
+        print(f"[broker] MT5 init failed: {mt5.last_error()}")
+        return False
+    return True
+
+
+def get_open_position(ticker: str) -> Optional[dict]:
+    """Return the open position for a ticker, or None if flat."""
+    if not _connect():
+        return None
+    positions = mt5.positions_get(symbol=ticker)
+    if positions:
+        p = positions[0]
+        return {
+            "ticket": p.ticket,
+            "type":   "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL",
+            "volume": p.volume,
+            "open_price": p.price_open,
+            "profit": p.profit,
+        }
+    return None
+
+
+def close_position(ticker: str) -> OrderResult:
+    """Close any open position on this ticker before opening a new one."""
+    if not _connect():
+        return OrderResult(False, None, "MT5 not available")
+
+    positions = mt5.positions_get(symbol=ticker)
+    if not positions:
+        return OrderResult(True, None, "No open position to close")
+
+    pos = positions[0]
+    tick = mt5.symbol_info_tick(ticker)
+    close_price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
+    order_type  = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+
+    request = {
+        "action":    mt5.TRADE_ACTION_DEAL,
+        "symbol":    ticker,
+        "volume":    pos.volume,
+        "type":      order_type,
+        "position":  pos.ticket,
+        "price":     close_price,
+        "deviation": 20,
+        "magic":     20250416,
+        "comment":   "claude_close",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request)
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        return OrderResult(True, result.order, f"Closed position {pos.ticket}", close_price)
+    return OrderResult(False, None, f"Close failed: {result.comment} (retcode {result.retcode})")
 
 
 def place_order(
     ticker: str,
     action: str,           # "BUY" or "SELL"
-    entry: float,
     stop_loss: float,
     take_profit: float,
-    position_usd: float,
+    lot_size: float = 0.02,
 ) -> OrderResult:
     """
-    Place a CFD market order with attached stop-loss and take-profit.
+    Place a market order on Exness via MT5.
 
-    Currently a STUB — logs the trade parameters and returns a simulated result.
-    Replace the body below with your broker's actual API call.
+    One-trade-at-a-time rule is enforced:
+    - If a position already exists for this ticker, it is closed first.
+    - Then the new order is opened.
 
-    Common broker API patterns:
-    ─────────────────────────────
-    OANDA:
-        POST https://api-fxtrade.oanda.com/v3/accounts/{id}/orders
-        Headers: Authorization: Bearer {token}
-
-    IG Group:
-        POST https://api.ig.com/gateway/deal/positions/otc
-        Headers: X-IG-API-KEY, X-SECURITY-TOKEN, CST
-
-    Capital.com:
-        POST https://api-capital.backend-capital.com/api/v1/positions
-        Headers: X-CAP-API-KEY, CST, X-SECURITY-TOKEN
-
-    Interactive Brokers (IBKR):
-        POST https://localhost:5000/v1/api/iserver/account/{id}/orders
-        (requires TWS Gateway running locally)
-
-    Exness / XM / HotForex:
-        Typically MT4/MT5 bridge or proprietary REST API.
-        Check your broker's developer portal for endpoint docs.
+    stop_loss and take_profit must be absolute price levels (not pips/points).
     """
 
-    # ── STUB: log and simulate ──────────────────────────────────
-    print(
-        f"[broker.py STUB] {action} {ticker} | "
-        f"Entry: ${entry:.2f} | SL: ${stop_loss:.2f} | TP: ${take_profit:.2f} | "
-        f"Size: ${position_usd:.2f}"
-    )
+    if not MT5_AVAILABLE:
+        return OrderResult(
+            False, None,
+            "[STUB] MetaTrader5 library not installed. "
+            "Run on Windows with MT5 terminal open to execute live trades."
+        )
 
-    # TODO: Replace this block with your real broker API call, e.g.:
-    #
-    # units = int(position_usd / entry)
-    # payload = {
-    #     "order": {
-    #         "type": "MARKET",
-    #         "instrument": ticker,
-    #         "units": str(units if action == "BUY" else -units),
-    #         "takeProfitOnFill": {"price": str(round(take_profit, 5))},
-    #         "stopLossOnFill": {"price": str(round(stop_loss, 5))},
-    #     }
-    # }
-    # resp = requests.post(
-    #     f"{BROKER_BASE_URL}/v3/accounts/{BROKER_ACCOUNT_ID}/orders",
-    #     json=payload,
-    #     headers={"Authorization": f"Bearer {BROKER_API_KEY}"},
-    # )
-    # data = resp.json()
-    # return OrderResult(
-    #     success=resp.ok,
-    #     order_id=data.get("orderCreateTransaction", {}).get("id"),
-    #     message=str(data),
-    #     filled_price=entry,
-    # )
+    if not _connect():
+        return OrderResult(False, None, "Could not connect to MT5 terminal")
 
-    return OrderResult(
-        success=True,
-        order_id="STUB-001",
-        message=f"[STUB] {action} {ticker} @ ${entry:.2f} queued (broker not connected yet)",
-        filled_price=entry,
-    )
+    # Enforce one-trade-at-a-time: close any existing position first
+    existing = get_open_position(ticker)
+    if existing:
+        close_result = close_position(ticker)
+        if not close_result.success:
+            return OrderResult(False, None, f"Could not close existing position: {close_result.message}")
+
+    # Fetch current market price
+    tick = mt5.symbol_info_tick(ticker)
+    if tick is None:
+        return OrderResult(False, None, f"Cannot get price for {ticker} — check symbol name in MT5 Market Watch")
+
+    price       = tick.ask if action == "BUY" else tick.bid
+    order_type  = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
+
+    # Validate SL/TP direction
+    if action == "BUY" and stop_loss >= price:
+        return OrderResult(False, None, f"BUY stop loss ({stop_loss}) must be below entry ({price:.2f})")
+    if action == "SELL" and stop_loss <= price:
+        return OrderResult(False, None, f"SELL stop loss ({stop_loss}) must be above entry ({price:.2f})")
+
+    request = {
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "symbol":       ticker,
+        "volume":       lot_size,
+        "type":         order_type,
+        "price":        price,
+        "sl":           round(stop_loss, 2),
+        "tp":           round(take_profit, 2),
+        "deviation":    20,           # max slippage in points
+        "magic":        20250416,     # EA identifier
+        "comment":      "claude_signal",
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request)
+
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        return OrderResult(
+            success=True,
+            order_id=result.order,
+            message=f"✅ {action} {lot_size} lot {ticker} @ {result.price:.2f} | SL {stop_loss:.2f} | TP {take_profit:.2f}",
+            filled_price=result.price,
+        )
+    else:
+        return OrderResult(
+            success=False,
+            order_id=None,
+            message=f"❌ Order failed: {result.comment} (retcode {result.retcode})",
+        )
