@@ -18,7 +18,7 @@ class TradeSignal:
     raw_signal: str
 
 
-_client = anthropic.Anthropic()
+_client = ANTHROPIC_API_KEY = "sk-ant-..."
 
 
 def analyse(
