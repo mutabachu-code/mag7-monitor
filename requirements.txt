@@ -1,7 +1,9 @@
+streamlit
 yfinance
 pandas
-pandas-ta
+numpy
 scipy
-streamlit
 streamlit-autorefresh
-anthropic 
+anthropic
+# MetaTrader5 is Windows-only — only install on local Windows machine, NOT on Streamlit Cloud
+# MetaTrader5
