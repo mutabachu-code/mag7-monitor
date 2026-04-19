@@ -1,12 +1,14 @@
 import anthropic
-import os
 
-client = anthropic.Anthropic()
+client = anthropic.Anthropic(api_key="sk-ant-your-key-here")
 
 response = client.messages.create(
-    model="claude-sonnet-4-20250514",
-    max_tokens=50,
-    messages=[{"role": "user", "content": "Say: Claude is connected to Mag7 dashboard"}]
+    model="claude-sonnet-4-5",
+    max_tokens=200,
+    messages=[{
+        "role": "user",
+        "content": "Analyse this: AAPL at $270, RSI 28, MACD bullish, above SMA200, volume surge 1.3x. BUY or SELL or HOLD? Reply in one sentence."
+    }]
 )
 
 print(response.content[0].text)
