@@ -75,7 +75,7 @@ Respond ONLY with a valid JSON object — no markdown, no preamble:
 
     try:
         response = _client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=600,
             messages=[{"role": "user", "content": prompt}],
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
