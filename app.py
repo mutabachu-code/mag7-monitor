@@ -130,7 +130,8 @@ def compute_indicators(label: str):
     gain    = (delta_p.where(delta_p > 0, 0)).rolling(window=14).mean()
     loss    = (-delta_p.where(delta_p < 0, 0)).rolling(window=14).mean()
     rs      = gain / loss
-    rsi     = 100 - (100 / (1 + rs)).iloc[-1]
+    rsi_series = 100 - (100 / (1 + rs))
+    rsi        = rsi_series.iloc[-1]
 
     df_5m = df_5m.copy()
     df_5m['vol_ma_long']  = df_5m['Volume'].rolling(window=20).mean()
@@ -144,16 +145,48 @@ def compute_indicators(label: str):
     ann_vol     = df_5m['Close'].pct_change().std() * np.sqrt(252 * 78)
     delta_val   = get_bs_delta(curr_p, start_price, 1/252, 0.045, ann_vol)
 
-    # Signal logic
+    # ── SIGNAL LOGIC ─────────────────────────────────────────────────────────
+    # RSI momentum: rate of change over last 5 candles
+    rsi_series  = 100 - (100 / (1 + gain / loss))
+    rsi_prev    = rsi_series.iloc[-6] if len(rsi_series) >= 6 else rsi
+    rsi_rising  = rsi > rsi_prev
+    rsi_falling = rsi < rsi_prev
+
+    # Price momentum: % change over last 12 candles (~1hr on 5m chart)
+    price_mom = (curr_p - df_5m['Close'].iloc[-13]) / df_5m['Close'].iloc[-13] * 100 if len(df_5m) >= 13 else 0
+
+    # ── MODE 1: DIP BUY — oversold pullback inside uptrend ───────────────────
     if curr_p > sma200_1h and rsi < 40 and vol_ratio > 1.1 and macd_bullish:
-        signal    = "🟢 STRONG BUY (Full Confluence)"
+        signal    = "🟢 STRONG BUY — Dip (Full Confluence)"
         sig_color = "green"
+
+    # ── MODE 2: MOMENTUM BUY — breakout surge with volume ────────────────────
+    elif (curr_p > sma200_1h and rsi > 60 and rsi < 80
+          and rsi_rising and vol_ratio > 1.3 and macd_bullish and price_mom > 0.3):
+        signal    = "🚀 MOMENTUM BUY — Breakout"
+        sig_color = "green"
+
+    # ── MODE 3: STRONG SELL — breakdown below SMA200 ─────────────────────────
     elif curr_p < sma200_1h and rsi > 60 and vol_ratio > 1.1 and not macd_bullish:
         signal    = "🔴 STRONG SELL (Full Confluence)"
         sig_color = "red"
+
+    # ── MODE 4: MOMENTUM SELL — collapse with volume ──────────────────────────
+    elif (curr_p < sma200_1h and rsi < 40 and rsi > 20
+          and rsi_falling and vol_ratio > 1.3 and not macd_bullish and price_mom < -0.3):
+        signal    = "💥 MOMENTUM SELL — Breakdown"
+        sig_color = "red"
+
+    # ── MODE 5: CAUTION BUY — partial setup, missing MACD ────────────────────
     elif curr_p > sma200_1h and rsi < 35:
         signal    = "🟡 Caution Buy (No MACD Confirm)"
         sig_color = "orange"
+
+    # ── MODE 6: OVERBOUGHT WARNING — rally may be exhausted ──────────────────
+    elif curr_p > sma200_1h and rsi > 75 and vol_ratio < 0.8:
+        signal    = "⚠️ Overbought — Watch for Reversal"
+        sig_color = "orange"
+
     else:
         signal    = "⚪ Neutral"
         sig_color = "gray"
