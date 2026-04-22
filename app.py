@@ -6,6 +6,7 @@ from scipy.stats import norm
 from streamlit_autorefresh import st_autorefresh
 
 from claude_analyst import analyse
+from iv_calculator import get_iv_data
 from risk_manager import RiskConfig, init_risk_state, render_risk_sidebar, check_trade_allowed, record_trade_opened
 
 # ── SETUP ─────────────────────────────────────────────────────────────────────
@@ -188,6 +189,9 @@ def compute_indicators(yfticker: str, label: str):
         signal    = "⚪ Neutral"
         sig_color = "gray"
 
+    # Fetch IV data (cached separately in iv_calculator)
+    iv = get_iv_data(label)
+
     return dict(
         label=label,
         curr_p=curr_p,
@@ -201,6 +205,7 @@ def compute_indicators(yfticker: str, label: str):
         delta_val=delta_val,
         signal=signal,
         sig_color=sig_color,
+        iv=iv,
     )
 
 
@@ -224,11 +229,33 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
             st.write(f"Vol Surge: {ind['vol_ratio']:.2f}x")
             st.write(f"Opt. Delta: {ind['delta_val']:.2f}")
             st.write(f"MACD: {'Bullish 📈' if ind['macd_bullish'] else 'Bearish 📉'}")
+            # IV display
+            iv = ind.get('iv')
+            if iv:
+                st.markdown("---")
+                src_tag = f" *(via {'VIX' if iv.source == 'vix_proxy' else 'options' if iv.source == 'options' else 'hist vol'})*"
+                st.markdown(
+                    f"**IV:** <span style='color:{iv.iv_color};font-weight:bold'>"
+                    f"{iv.current_iv:.1f}%</span> — **{iv.iv_label}**{src_tag}",
+                    unsafe_allow_html=True
+                )
+                iv_col1, iv_col2 = st.columns(2)
+                iv_col1.metric("IV Rank", f"{iv.iv_rank:.0f}/100")
+                iv_col2.metric("IV Percentile", f"{iv.iv_percentile:.0f}%")
+                st.progress(
+                    int(min(iv.iv_rank, 100)) / 100,
+                    text=f"IV Rank: {iv.iv_rank:.0f}% of 52w range"
+                )
 
         if ind["signal"] != "⚪ Neutral":
             with st.expander("🤖 Claude AI Analysis", expanded=True):
                 trade_allowed, trade_reason = check_trade_allowed(risk_config, ind["label"])
 
+                iv      = ind.get('iv')
+                iv_str  = (
+                    f"{iv.current_iv:.1f}% (Rank {iv.iv_rank:.0f}/100, {iv.iv_label})"
+                    if iv else "unavailable"
+                )
                 ai = analyse(
                     ticker=ind["label"],
                     current_price=ind["curr_p"],
@@ -241,6 +268,7 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
                     sma200=ind["sma200_1h"],
                     account_balance=risk_config.account_size_usd,
                     lot_size=risk_config.lot_size,
+                    implied_volatility=iv_str,
                 )
 
                 if ai is None:
