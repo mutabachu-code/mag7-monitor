@@ -1,12 +1,12 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.stats import norm
 from streamlit_autorefresh import st_autorefresh
 
-from claude_analyst import analyse
+from data_fetcher import fetch_all_data, get_5m, get_1h, get_1d, get_vix, MAG7, NAS100_YF
 from iv_calculator import get_iv_data
+from claude_analyst import analyse
 from risk_manager import RiskConfig, init_risk_state, render_risk_sidebar, check_trade_allowed, record_trade_opened
 
 # ── SETUP ─────────────────────────────────────────────────────────────────────
@@ -25,15 +25,23 @@ risk_config = render_risk_sidebar(risk_config)
 st.title("🛡️ Mag 7 + NAS100 MTF Monitor + Claude AI")
 st.caption(
     f"Last Update: {pd.Timestamp.now().strftime('%H:%M:%S')} | "
-    "5m Signals · 1H MACD · Claude Analysis (News + Sentiment + Technicals)"
+    "5m Signals · 1H MACD · IV Analysis · Claude AI"
 )
 
-# ── TICKERS ───────────────────────────────────────────────────────────────────
-MAG7    = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA']
-NAS100_TICKER = '^NDX'   # Nasdaq-100 index via yfinance
-NAS100_LABEL  = 'NAS100'
+NAS100_LABEL = 'NAS100'
+
+# ── SINGLE BATCH FETCH (replaces 48 individual calls) ─────────────────────────
+with st.spinner("Fetching market data..."):
+    data_ok = fetch_all_data()
+
+if not data_ok:
+    st.error("⚠️ Market data unavailable — yfinance may be rate-limited. Will retry on next refresh.")
+    st.stop()
+
+vix_value = get_vix()
 
 
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 def get_bs_delta(S, K, T, r, sigma):
     if T <= 0 or sigma <= 0 or S <= 0:
         return 0.5
@@ -41,87 +49,49 @@ def get_bs_delta(S, K, T, r, sigma):
     return norm.cdf(d1)
 
 
-# ── HEATMAP CALCULATION ───────────────────────────────────────────────────────
-def compute_heatmap(tickers: list) -> pd.DataFrame:
-    """
-    Fetch hourly close prices for all Mag7 tickers + NAS100.
-    Returns a DataFrame of 1-hour returns for heatmap rendering.
-    Adds small delay between requests to avoid yfinance rate limits.
-    """
-    import time as _time
+# ── HEATMAP ───────────────────────────────────────────────────────────────────
+def render_heatmap():
+    st.subheader("📊 NAS100 + Mag 7 Hourly Heatmap")
+    st.caption("Hourly % returns · Green = up · Red = down · Intensity = magnitude")
+
     rows = []
-    for ticker in tickers:
+    all_labels = [NAS100_LABEL] + MAG7
+
+    for label in all_labels:
+        df = get_1d(label)   # already fetched — no new API call
+        if df is None or df.empty:
+            continue
         try:
-            yfticker = NAS100_TICKER if ticker == NAS100_LABEL else ticker
-            df = yf.Ticker(yfticker).history(period="2d", interval="1h").ffill().bfill()
-            _time.sleep(0.3)
-            if len(df) < 2:
-                continue
-            # Last 8 hourly candles (1 trading day)
-            closes = df['Close'].tail(8)
+            closes     = df['Close'].tail(8)
             pct_changes = closes.pct_change().dropna() * 100
-            row = {"Ticker": ticker}
-            for j, (ts, val) in enumerate(pct_changes.items()):
+            row = {"Ticker": label, "Price": round(closes.iloc[-1], 2)}
+            for j, (_, val) in enumerate(pct_changes.items()):
                 row[f"H{j+1}"] = round(val, 2)
             row["Day %"] = round(
                 (closes.iloc[-1] - closes.iloc[0]) / closes.iloc[0] * 100, 2
             )
-            row["Price"] = round(closes.iloc[-1], 2)
             rows.append(row)
         except Exception as e:
-            print(f"[heatmap] Error for {ticker}: {e}")
-    return pd.DataFrame(rows)
+            print(f"[heatmap] {label}: {e}")
 
-
-def color_cell(val):
-    """Return green/red background CSS based on positive/negative return."""
-    if pd.isna(val) or not isinstance(val, (int, float)):
-        return ""
-    if val > 1.0:
-        return "background-color: #1a7a1a; color: white"
-    elif val > 0.3:
-        return "background-color: #2d9e2d; color: white"
-    elif val > 0:
-        return "background-color: #5cb85c; color: white"
-    elif val > -0.3:
-        return "background-color: #d9534f; color: white"
-    elif val > -1.0:
-        return "background-color: #c9302c; color: white"
-    else:
-        return "background-color: #8b0000; color: white"
-
-
-def render_heatmap():
-    """Render the NAS100 + Mag7 heatmap section."""
-    st.subheader("📊 NAS100 + Mag 7 Hourly Heatmap")
-    st.caption("Hourly % returns for today · Green = up · Red = down · Intensity = magnitude")
-
-    all_tickers = [NAS100_LABEL] + MAG7
-
-    # Cache heatmap for 5 minutes to avoid hammering yfinance on every 60s refresh
-    import time as _time
-    cache = st.session_state.get("heatmap_cache", None)
-    cache_age = _time.time() - st.session_state.get("heatmap_ts", 0)
-
-    if cache is None or cache_age > 300:
-        with st.spinner("Loading heatmap data..."):
-            df = compute_heatmap(all_tickers)
-        st.session_state["heatmap_cache"] = df
-        st.session_state["heatmap_ts"] = _time.time()
-    else:
-        df = cache
-
-    if df.empty:
+    if not rows:
         st.warning("Heatmap data unavailable — market may be closed.")
         return
 
-    # Style the heatmap
-    hour_cols = [c for c in df.columns if c.startswith("H")]
-    display_cols = ["Ticker", "Price", "Day %"] + hour_cols
+    df_hm      = pd.DataFrame(rows).set_index("Ticker")
+    hour_cols  = [c for c in df_hm.columns if c.startswith("H")]
 
-    df_display = df[display_cols].set_index("Ticker")
+    def color_cell(val):
+        if pd.isna(val) or not isinstance(val, (int, float)):
+            return ""
+        if val > 1.0:   return "background-color:#1a7a1a;color:white"
+        elif val > 0.3: return "background-color:#2d9e2d;color:white"
+        elif val > 0:   return "background-color:#5cb85c;color:white"
+        elif val > -0.3:return "background-color:#d9534f;color:white"
+        elif val > -1.0:return "background-color:#c9302c;color:white"
+        else:           return "background-color:#8b0000;color:white"
 
-    styled = df_display.style.map(
+    styled = df_hm.style.map(
         color_cell, subset=["Day %"] + hour_cols
     ).format({
         "Price": "${:,.2f}",
@@ -133,16 +103,14 @@ def render_heatmap():
     st.divider()
 
 
-# ── INDICATOR ENGINE (shared for Mag7 + NAS100) ───────────────────────────────
-def compute_indicators(yfticker: str, label: str):
-    """
-    Fetch data and compute all indicators for one ticker.
-    Returns a dict of indicator values, or None on failure.
-    """
-    stock  = yf.Ticker(yfticker)
-    df_5m  = stock.history(period="5d",  interval="5m",  prepost=True).ffill().bfill()
-    df_1h  = stock.history(period="60d", interval="1h").ffill().bfill()
+# ── INDICATOR ENGINE ──────────────────────────────────────────────────────────
+def compute_indicators(label: str):
+    df_5m = get_5m(label)
+    df_1h = get_1h(label)
+    df_1d = get_1d(label)
 
+    if df_5m is None or df_1h is None:
+        return None
     if len(df_1h) < 200 or len(df_5m) < 20:
         return None
 
@@ -164,6 +132,7 @@ def compute_indicators(yfticker: str, label: str):
     rs      = gain / loss
     rsi     = 100 - (100 / (1 + rs)).iloc[-1]
 
+    df_5m = df_5m.copy()
     df_5m['vol_ma_long']  = df_5m['Volume'].rolling(window=20).mean()
     df_5m['vol_ma_short'] = df_5m['Volume'].rolling(window=5).mean()
     vol_ratio = (
@@ -189,59 +158,45 @@ def compute_indicators(yfticker: str, label: str):
         signal    = "⚪ Neutral"
         sig_color = "gray"
 
-    # Fetch IV data (cached separately in iv_calculator)
-    iv = get_iv_data(label)
+    # IV — uses batched daily data, no extra fetch
+    iv = get_iv_data(label, curr_p, df_1d, vix_value)
 
     return dict(
-        label=label,
-        curr_p=curr_p,
-        prev_p=prev_p,
-        sma200_1h=sma200_1h,
-        trend_status=trend_status,
-        trend_color=trend_color,
-        macd_bullish=macd_bullish,
-        rsi=rsi,
-        vol_ratio=vol_ratio,
-        delta_val=delta_val,
-        signal=signal,
-        sig_color=sig_color,
-        iv=iv,
+        label=label, curr_p=curr_p, prev_p=prev_p,
+        sma200_1h=sma200_1h, trend_status=trend_status, trend_color=trend_color,
+        macd_bullish=macd_bullish, rsi=rsi, vol_ratio=vol_ratio,
+        delta_val=delta_val, signal=signal, sig_color=sig_color, iv=iv,
     )
 
 
+# ── TICKER CARD ───────────────────────────────────────────────────────────────
 def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
-    """Render one ticker card — shared by Mag7 and NAS100."""
     with col:
         st.metric(
             label=ind["label"],
             value=f"${ind['curr_p']:,.2f}",
             delta=f"{ind['curr_p'] - ind['prev_p']:.2f}",
         )
-        st.markdown(
-            f"**Trend (1H SMA200):** :{ind['trend_color']}[{ind['trend_status']}]"
-        )
-        st.markdown(
-            f"**Signal:** :{ind['sig_color']}[{ind['signal']}]"
-        )
+        st.markdown(f"**Trend (1H SMA200):** :{ind['trend_color']}[{ind['trend_status']}]")
+        st.markdown(f"**Signal:** :{ind['sig_color']}[{ind['signal']}]")
 
         with st.expander("Technical Details"):
             st.write(f"RSI (5m): {ind['rsi']:.1f}")
             st.write(f"Vol Surge: {ind['vol_ratio']:.2f}x")
             st.write(f"Opt. Delta: {ind['delta_val']:.2f}")
             st.write(f"MACD: {'Bullish 📈' if ind['macd_bullish'] else 'Bearish 📉'}")
-            # IV display
             iv = ind.get('iv')
             if iv:
                 st.markdown("---")
-                src_tag = f" *(via {'VIX' if iv.source == 'vix_proxy' else 'options' if iv.source == 'options' else 'hist vol'})*"
+                src = {'vix_proxy':'VIX','options':'options','historical':'hist vol'}.get(iv.source, iv.source)
                 st.markdown(
                     f"**IV:** <span style='color:{iv.iv_color};font-weight:bold'>"
-                    f"{iv.current_iv:.1f}%</span> — **{iv.iv_label}**{src_tag}",
-                    unsafe_allow_html=True
+                    f"{iv.current_iv:.1f}%</span> — **{iv.iv_label}** *({src})*",
+                    unsafe_allow_html=True,
                 )
-                iv_col1, iv_col2 = st.columns(2)
-                iv_col1.metric("IV Rank", f"{iv.iv_rank:.0f}/100")
-                iv_col2.metric("IV Percentile", f"{iv.iv_percentile:.0f}%")
+                c1, c2 = st.columns(2)
+                c1.metric("IV Rank",       f"{iv.iv_rank:.0f}/100")
+                c2.metric("IV Percentile", f"{iv.iv_percentile:.0f}%")
                 st.progress(
                     int(min(iv.iv_rank, 100)) / 100,
                     text=f"IV Rank: {iv.iv_rank:.0f}% of 52w range"
@@ -251,11 +206,12 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
             with st.expander("🤖 Claude AI Analysis", expanded=True):
                 trade_allowed, trade_reason = check_trade_allowed(risk_config, ind["label"])
 
-                iv      = ind.get('iv')
-                iv_str  = (
+                iv     = ind.get('iv')
+                iv_str = (
                     f"{iv.current_iv:.1f}% (Rank {iv.iv_rank:.0f}/100, {iv.iv_label})"
                     if iv else "unavailable"
                 )
+
                 ai = analyse(
                     ticker=ind["label"],
                     current_price=ind["curr_p"],
@@ -274,10 +230,7 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
                 if ai is None:
                     st.warning("Claude analysis unavailable — check API key.")
                 else:
-                    action_color = {
-                        "BUY": "green", "SELL": "red", "HOLD": "gray"
-                    }.get(ai.action, "gray")
-
+                    action_color = {"BUY":"green","SELL":"red","HOLD":"gray"}.get(ai.action,"gray")
                     st.markdown(
                         f"**Decision:** :{action_color}[{ai.action}] "
                         f"| Confidence: **{ai.confidence}**"
@@ -290,20 +243,18 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
                         c1, c2, c3 = st.columns(3)
                         c1.metric("Entry",       f"${ai.entry_price:,.2f}")
                         c2.metric("Stop Loss",   f"${ai.stop_loss:,.2f}",
-                                  delta=f"{((ai.stop_loss - ai.entry_price)/ai.entry_price*100):+.2f}%",
+                                  delta=f"{((ai.stop_loss-ai.entry_price)/ai.entry_price*100):+.2f}%",
                                   delta_color="off")
                         c3.metric("Take Profit", f"${ai.take_profit:,.2f}",
-                                  delta=f"{((ai.take_profit - ai.entry_price)/ai.entry_price*100):+.2f}%",
+                                  delta=f"{((ai.take_profit-ai.entry_price)/ai.entry_price*100):+.2f}%",
                                   delta_color="off")
 
                         risk_usd   = abs(ai.entry_price - ai.stop_loss) * (ai.lot_size * 100)
                         reward_usd = abs(ai.take_profit - ai.entry_price) * (ai.lot_size * 100)
                         rr         = reward_usd / risk_usd if risk_usd > 0 else 0
                         st.caption(
-                            f"Lot: {ai.lot_size} | "
-                            f"Risk: ~${risk_usd:.2f} | "
-                            f"Reward: ~${reward_usd:.2f} | "
-                            f"R:R = {rr:.1f}:1"
+                            f"Lot: {ai.lot_size} | Risk: ~${risk_usd:.2f} | "
+                            f"Reward: ~${reward_usd:.2f} | R:R = {rr:.1f}:1"
                         )
 
                         if trade_allowed:
@@ -342,15 +293,13 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
 # MAIN RENDER
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── SECTION 1: HEATMAP ────────────────────────────────────────────────────────
 render_heatmap()
 
-# ── SECTION 2: NAS100 CARD ────────────────────────────────────────────────────
+# NAS100
 st.subheader("📈 Nasdaq 100 Cash CFD (NAS100)")
 nas_col, _, _, _ = st.columns(4)
-
 try:
-    nas_ind = compute_indicators(NAS100_TICKER, NAS100_LABEL)
+    nas_ind = compute_indicators(NAS100_LABEL)
     if nas_ind:
         render_ticker_card(nas_ind, nas_col, risk_config)
     else:
@@ -362,13 +311,12 @@ except Exception as e:
 
 st.divider()
 
-# ── SECTION 3: MAG 7 CARDS ────────────────────────────────────────────────────
+# Mag 7
 st.subheader("🛡️ Magnificent 7 Stocks")
 cols = st.columns(4)
-
 for i, ticker in enumerate(MAG7):
     try:
-        ind = compute_indicators(ticker, ticker)
+        ind = compute_indicators(ticker)
         if ind:
             render_ticker_card(ind, cols[i % 4], risk_config)
     except Exception as e:
