@@ -43,15 +43,17 @@ def get_bs_delta(S, K, T, r, sigma):
 # ── HEATMAP CALCULATION ───────────────────────────────────────────────────────
 def compute_heatmap(tickers: list) -> pd.DataFrame:
     """
-    Fetch 5-day 5m close prices for all Mag7 tickers + NAS100.
+    Fetch hourly close prices for all Mag7 tickers + NAS100.
     Returns a DataFrame of 1-hour returns for heatmap rendering.
-    Uses yfinance batch download for efficiency (one API call).
+    Adds small delay between requests to avoid yfinance rate limits.
     """
+    import time as _time
     rows = []
     for ticker in tickers:
         try:
             yfticker = NAS100_TICKER if ticker == NAS100_LABEL else ticker
             df = yf.Ticker(yfticker).history(period="2d", interval="1h").ffill().bfill()
+            _time.sleep(0.3)
             if len(df) < 2:
                 continue
             # Last 8 hourly candles (1 trading day)
@@ -94,8 +96,19 @@ def render_heatmap():
     st.caption("Hourly % returns for today · Green = up · Red = down · Intensity = magnitude")
 
     all_tickers = [NAS100_LABEL] + MAG7
-    with st.spinner("Loading heatmap data..."):
-        df = compute_heatmap(all_tickers)
+
+    # Cache heatmap for 5 minutes to avoid hammering yfinance on every 60s refresh
+    import time as _time
+    cache = st.session_state.get("heatmap_cache", None)
+    cache_age = _time.time() - st.session_state.get("heatmap_ts", 0)
+
+    if cache is None or cache_age > 300:
+        with st.spinner("Loading heatmap data..."):
+            df = compute_heatmap(all_tickers)
+        st.session_state["heatmap_cache"] = df
+        st.session_state["heatmap_ts"] = _time.time()
+    else:
+        df = cache
 
     if df.empty:
         st.warning("Heatmap data unavailable — market may be closed.")
@@ -107,7 +120,7 @@ def render_heatmap():
 
     df_display = df[display_cols].set_index("Ticker")
 
-    styled = df_display.style.applymap(
+    styled = df_display.style.map(
         color_cell, subset=["Day %"] + hour_cols
     ).format({
         "Price": "${:,.2f}",
