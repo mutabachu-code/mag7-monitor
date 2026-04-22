@@ -56,6 +56,7 @@ def analyse(
     sma200: float,
     account_balance: float = 100.0,
     lot_size: float = 0.02,
+    implied_volatility: str = "unavailable",
 ) -> Optional[TradeSignal]:
 
     # ── CACHE CHECK ───────────────────────────────────────────────────────────
@@ -74,6 +75,7 @@ Trend vs SMA200    : {trend_status}
 RSI (5m, 14-period): {rsi:.1f}
 Volume Surge Ratio : {vol_ratio:.2f}x  (>1.2 = elevated volume)
 MACD (1H)          : {"Bullish — MACD line above signal line" if macd_bullish else "Bearish — MACD line below signal line"}
+Implied Volatility : {implied_volatility}
 Options Delta      : {delta_val:.2f}
 Dashboard Signal   : {raw_signal}
 
@@ -86,8 +88,12 @@ Take Profit Rule   : Minimum 2:1 reward-to-risk ratio
 === YOUR TASK ===
 STEP 1 — Check technicals are valid for a trade.
 STEP 2 — Search for latest news, sentiment, analyst views on {ticker} today.
-STEP 3 — Combine both into a final BUY / SELL / HOLD decision.
-Downgrade to HOLD if adverse news, earnings risk, or macro contradicts the signal.
+STEP 3 — Factor in Implied Volatility:
+- HIGH IV Rank (>60): options are expensive — prefer selling strategies or tighter SL
+- LOW IV Rank (<35): options are cheap — favours directional trades with wider TP targets
+- EXTREME IV (>80): avoid new entries unless signal is exceptionally strong
+STEP 4 — Combine technicals + news + IV into a final BUY / SELL / HOLD decision.
+Downgrade to HOLD if adverse news, earnings risk, extreme IV, or macro contradicts the signal.
 
 IMPORTANT: Plain text only in all string fields — no <cite> tags, no HTML, no markup.
 
