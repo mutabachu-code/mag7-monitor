@@ -4,7 +4,7 @@ import numpy as np
 from scipy.stats import norm
 from streamlit_autorefresh import st_autorefresh
 
-from data_fetcher import fetch_all_data, get_5m, get_1h, get_1d, get_vix, MAG7, NAS100_YF
+from data_fetcher import fetch_all_data, get_5m, get_1h, get_1d, get_vix, get_heatmap_data, MAG7, NAS100_YF
 from iv_calculator import get_iv_data
 from claude_analyst import analyse
 from risk_manager import RiskConfig, init_risk_state, render_risk_sidebar, check_trade_allowed, record_trade_opened
@@ -73,46 +73,70 @@ def render_heatmap():
     all_labels = [NAS100_LABEL] + MAG7
 
     for label in all_labels:
-        df = get_1d(label)   # already fetched — no new API call
+        df = get_heatmap_data(label)   # uses 1h data from cache
         if df is None or df.empty:
             continue
         try:
-            closes     = df['Close'].tail(8)
+            # Normalise column names
+            df.columns = [c.capitalize() for c in df.columns]
+            if 'Close' not in df.columns:
+                continue
+
+            # Use last 8 hourly candles for intraday view
+            closes      = df['Close'].dropna().tail(8)
+            if len(closes) < 2:
+                continue
+
             pct_changes = closes.pct_change().dropna() * 100
-            row = {"Ticker": label, "Price": round(closes.iloc[-1], 2)}
+            row = {"Ticker": label, "Price": round(float(closes.iloc[-1]), 2)}
+
             for j, (_, val) in enumerate(pct_changes.items()):
-                row[f"H{j+1}"] = round(val, 2)
+                row[f"H{j+1}"] = round(float(val), 2)
+
+            # Day % = first to last close in the window
             row["Day %"] = round(
-                (closes.iloc[-1] - closes.iloc[0]) / closes.iloc[0] * 100, 2
+                float((closes.iloc[-1] - closes.iloc[0]) / closes.iloc[0] * 100), 2
             )
             rows.append(row)
+
         except Exception as e:
             print(f"[heatmap] {label}: {e}")
 
     if not rows:
-        st.warning("Heatmap data unavailable — market may be closed.")
+        st.warning("Heatmap data unavailable — market may be closed or data still loading.")
         return
 
-    df_hm      = pd.DataFrame(rows).set_index("Ticker")
-    hour_cols  = [c for c in df_hm.columns if c.startswith("H")]
+    df_hm     = pd.DataFrame(rows).set_index("Ticker")
+    hour_cols = sorted([c for c in df_hm.columns if c.startswith("H")])
+
+    # Fill missing hour columns with 0
+    for h in hour_cols:
+        df_hm[h] = pd.to_numeric(df_hm[h], errors='coerce').fillna(0)
+    df_hm["Day %"] = pd.to_numeric(df_hm["Day %"], errors='coerce').fillna(0)
 
     def color_cell(val):
-        if pd.isna(val) or not isinstance(val, (int, float)):
+        try:
+            val = float(val)
+        except (TypeError, ValueError):
             return ""
-        if val > 1.0:   return "background-color:#1a7a1a;color:white"
-        elif val > 0.3: return "background-color:#2d9e2d;color:white"
-        elif val > 0:   return "background-color:#5cb85c;color:white"
-        elif val > -0.3:return "background-color:#d9534f;color:white"
-        elif val > -1.0:return "background-color:#c9302c;color:white"
-        else:           return "background-color:#8b0000;color:white"
+        if val > 1.5:    return "background-color:#1a7a1a;color:white"
+        elif val > 0.5:  return "background-color:#2d9e2d;color:white"
+        elif val > 0.1:  return "background-color:#5cb85c;color:white"
+        elif val > -0.1: return "background-color:#888;color:white"
+        elif val > -0.5: return "background-color:#d9534f;color:white"
+        elif val > -1.5: return "background-color:#c9302c;color:white"
+        else:            return "background-color:#8b0000;color:white"
 
-    styled = df_hm.style.map(
-        color_cell, subset=["Day %"] + hour_cols
-    ).format({
-        "Price": "${:,.2f}",
-        "Day %": "{:+.2f}%",
-        **{h: "{:+.2f}%" for h in hour_cols}
-    })
+    cols_to_color = ["Day %"] + hour_cols
+    fmt = {"Price": "${:,.2f}", "Day %": "{:+.2f}%"}
+    fmt.update({h: "{:+.2f}%" for h in hour_cols})
+
+    styled = (
+        df_hm[["Price", "Day %"] + hour_cols]
+        .style
+        .map(color_cell, subset=cols_to_color)
+        .format(fmt)
+    )
 
     st.dataframe(styled, use_container_width=True, height=320)
     st.divider()
@@ -344,7 +368,7 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
 render_heatmap()
 
 # NAS100
-st.subheader("📈 Nasdaq 100 Cash CFD (NAS100)")
+st.subheader("📈 Nasdaq 100 Cash CFD (NAS100 / QQQ proxy)")
 nas_col, _, _, _ = st.columns(4)
 try:
     nas_ind = compute_indicators(NAS100_LABEL)
