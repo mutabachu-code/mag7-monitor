@@ -115,6 +115,20 @@ def _fetch_vix() -> Optional[float]:
     return _fetch_with_timeout(get, FETCH_TIMEOUT)
 
 
+def _fetch_ndx_ratio() -> Optional[float]:
+    """
+    Fetch actual ^NDX close and QQQ close to compute live scaling ratio.
+    This way NAS100 display price stays accurate as ratio drifts over time.
+    """
+    def get():
+        ndx = yf.Ticker('^NDX').history(period="5d", interval="1d")
+        qqq = yf.Ticker('QQQ').history(period="5d", interval="1d")
+        if ndx.empty or qqq.empty:
+            return None
+        return float(ndx['Close'].iloc[-1]) / float(qqq['Close'].iloc[-1])
+    return _fetch_with_timeout(get, FETCH_TIMEOUT)
+
+
 # ── PARALLEL FETCH ALL ────────────────────────────────────────────────────────
 
 def fetch_all_data() -> bool:
@@ -140,17 +154,26 @@ def fetch_all_data() -> bool:
         threads.append(t)
         t.start()
 
-    # Also fetch VIX in parallel
-    vix_result = [None]
+    # Also fetch VIX and NDX ratio in parallel
+    vix_result   = [None]
+    ratio_result = [None]
+
     def fetch_vix_thread():
         vix_result[0] = _fetch_vix()
-    vix_thread = threading.Thread(target=fetch_vix_thread, daemon=True)
+
+    def fetch_ratio_thread():
+        ratio_result[0] = _fetch_ndx_ratio()
+
+    vix_thread   = threading.Thread(target=fetch_vix_thread,   daemon=True)
+    ratio_thread = threading.Thread(target=fetch_ratio_thread, daemon=True)
     vix_thread.start()
+    ratio_thread.start()
 
     # Wait for all (max FETCH_TIMEOUT + 2s buffer)
     for t in threads:
         t.join(timeout=FETCH_TIMEOUT + 2)
     vix_thread.join(timeout=FETCH_TIMEOUT + 2)
+    ratio_thread.join(timeout=FETCH_TIMEOUT + 2)
 
     # Store results
     any_success = False
@@ -161,7 +184,9 @@ def fetch_all_data() -> bool:
         _store_cache(f"df_1h_{label}", df_1h)
         _store_cache(f"df_1d_{label}", df_1d)
 
-    _store_cache("vix_value", vix_result[0])
+    _store_cache("vix_value",   vix_result[0])
+    # Store ratio with fallback of 40.0 if fetch fails
+    _store_cache("qqq_ndx_ratio", ratio_result[0] if ratio_result[0] else 40.0)
 
     if any_success:
         st.session_state["data_fetch_ts"] = time.time()
@@ -183,6 +208,10 @@ def get_1d(label: str) -> Optional[pd.DataFrame]:
 
 def get_vix() -> Optional[float]:
     return _load_cache("vix_value")
+
+def get_qqq_ndx_ratio() -> float:
+    """Returns QQQ→NAS100 scaling ratio. Defaults to 40.0 if unavailable."""
+    return _load_cache("qqq_ndx_ratio") or 40.0
 
 def get_heatmap_data(label: str) -> Optional[pd.DataFrame]:
     """
