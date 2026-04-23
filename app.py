@@ -88,7 +88,8 @@ def render_heatmap():
                 continue
 
             pct_changes = closes.pct_change().dropna() * 100
-            row = {"Ticker": label, "Price": round(float(closes.iloc[-1]), 2)}
+            display_label = "NAS100(QQQ)" if label == NAS100_LABEL else label
+            row = {"Ticker": display_label, "Price": round(float(closes.iloc[-1]), 2)}
 
             for j, (_, val) in enumerate(pct_changes.items()):
                 row[f"H{j+1}"] = round(float(val), 2)
