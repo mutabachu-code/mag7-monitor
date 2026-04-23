@@ -30,13 +30,28 @@ st.caption(
 
 NAS100_LABEL = 'NAS100'
 
-# ── SINGLE BATCH FETCH (replaces 48 individual calls) ─────────────────────────
+# ── DATA FETCH (parallel with timeouts — never freezes) ──────────────────────
+import time as _time
+fetch_start = _time.time()
+
 with st.spinner("Fetching market data..."):
     data_ok = fetch_all_data()
 
+fetch_elapsed = _time.time() - fetch_start
+
 if not data_ok:
-    st.error("⚠️ Market data unavailable — yfinance may be rate-limited. Will retry on next refresh.")
-    st.stop()
+    # Check if we have stale cached data to show instead of blank screen
+    has_stale = any(
+        st.session_state.get(f"df_5m_{t}") is not None
+        for t in (['NAS100'] + ['AAPL','MSFT','GOOGL','AMZN','TSLA','META','NVDA'])
+    )
+    if has_stale:
+        st.warning("⚠️ Live data fetch failed — showing last known prices. Retrying next refresh.")
+    else:
+        st.error("⚠️ No market data available. Market may be closed or yfinance is rate-limited.")
+        st.stop()
+elif fetch_elapsed > 15:
+    st.caption(f"⏱️ Data loaded in {fetch_elapsed:.0f}s (slow connection)")
 
 vix_value = get_vix()
 
