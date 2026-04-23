@@ -4,7 +4,7 @@ import numpy as np
 from scipy.stats import norm
 from streamlit_autorefresh import st_autorefresh
 
-from data_fetcher import fetch_all_data, get_5m, get_1h, get_1d, get_vix, get_heatmap_data, MAG7
+from data_fetcher import fetch_all_data, get_5m, get_1h, get_1d, get_vix, get_heatmap_data, get_qqq_ndx_ratio, MAG7
 from iv_calculator import get_iv_data
 from claude_analyst import analyse
 from risk_manager import RiskConfig, init_risk_state, render_risk_sidebar, check_trade_allowed, record_trade_opened
@@ -156,6 +156,14 @@ def compute_indicators(label: str):
     sma200_1h    = df_1h['Close'].rolling(window=200).mean().iloc[-1]
     curr_p       = df_5m['Close'].iloc[-1]
     prev_p       = df_5m['Close'].iloc[-2]
+
+    # Scale QQQ price to NAS100 index value using live ratio
+    if label == NAS100_LABEL:
+        ratio     = get_qqq_ndx_ratio()   # live ^NDX / QQQ ratio
+        curr_p    = round(curr_p    * ratio, 0)
+        prev_p    = round(prev_p    * ratio, 0)
+        sma200_1h = round(sma200_1h * ratio, 0)
+
     trend_status = "BULLISH" if curr_p > sma200_1h else "BEARISH"
     trend_color  = "green" if trend_status == "BULLISH" else "red"
 
