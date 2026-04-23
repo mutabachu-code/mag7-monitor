@@ -18,7 +18,7 @@ from typing import Dict, Optional, Tuple
 
 MAG7         = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA']
 NAS100_LABEL = 'NAS100'
-NAS100_YF    = '^NDX'
+NAS100_YF    = 'QQQ'   # QQQ ETF = reliable Nasdaq-100 proxy (^NDX often blocked by yfinance)
 VIX_YF       = '^VIX'
 ALL_LABELS   = [NAS100_LABEL] + MAG7
 
@@ -183,3 +183,14 @@ def get_1d(label: str) -> Optional[pd.DataFrame]:
 
 def get_vix() -> Optional[float]:
     return _load_cache("vix_value")
+
+def get_heatmap_data(label: str) -> Optional[pd.DataFrame]:
+    """
+    Returns 1h data for heatmap (best resolution).
+    Falls back to 1d if 1h unavailable.
+    Uses QQQ for NAS100 label.
+    """
+    df = _load_cache(f"df_1h_{label}")
+    if df is not None and not df.empty:
+        return df
+    return _load_cache(f"df_1d_{label}")
