@@ -4,7 +4,7 @@ import numpy as np
 from scipy.stats import norm
 from streamlit_autorefresh import st_autorefresh
 
-from data_fetcher import fetch_all_data, get_5m, get_1h, get_1d, get_vix, get_heatmap_data, MAG7, NAS100_YF
+from data_fetcher import fetch_all_data, get_5m, get_1h, get_1d, get_vix, get_heatmap_data, MAG7
 from iv_calculator import get_iv_data
 from claude_analyst import analyse
 from risk_manager import RiskConfig, init_risk_state, render_risk_sidebar, check_trade_allowed, record_trade_opened
@@ -368,7 +368,7 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
 render_heatmap()
 
 # NAS100
-st.subheader("📈 Nasdaq 100 Cash CFD (NAS100 / QQQ proxy)")
+st.subheader("📈 Nasdaq 100 Cash CFD (NAS100)")
 nas_col, _, _, _ = st.columns(4)
 try:
     nas_ind = compute_indicators(NAS100_LABEL)
