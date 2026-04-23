@@ -1,12 +1,11 @@
 """
-data_fetcher.py
----------------
-Single data fetching layer for the entire dashboard.
-Batches ALL yfinance calls into as few requests as possible.
-Caches results for 60 seconds so the dashboard never blocks.
-
-Before this fix: 48 individual yfinance calls per refresh
-After this fix : 4 batched yfinance calls per refresh
+data_fetcher.py  —  v3
+-----------------------
+Fetches market data with:
+- Individual yf.Ticker calls (more reliable than yf.download on Streamlit Cloud)
+- Hard 8-second timeout per ticker via threading
+- 65-second session cache — only fetches when cache expires
+- Never blocks the Streamlit thread
 """
 
 import yfinance as yf
@@ -14,163 +13,173 @@ import pandas as pd
 import numpy as np
 import time
 import streamlit as st
-from typing import Dict, Optional
+import threading
+from typing import Dict, Optional, Tuple
 
-# Ticker mappings
 MAG7         = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA']
+NAS100_LABEL = 'NAS100'
 NAS100_YF    = '^NDX'
 VIX_YF       = '^VIX'
-ALL_YF       = MAG7 + [NAS100_YF, VIX_YF]
+ALL_LABELS   = [NAS100_LABEL] + MAG7
 
-CACHE_TTL    = 65   # seconds — slightly longer than 60s refresh interval
-
-
-def _cache_valid(key: str) -> bool:
-    ts = st.session_state.get(f"{key}_ts", 0)
-    return (time.time() - ts) < CACHE_TTL
+CACHE_TTL    = 65    # seconds
+FETCH_TIMEOUT = 8   # seconds per ticker before giving up
 
 
-def _store(key: str, data):
-    st.session_state[key]        = data
-    st.session_state[f"{key}_ts"] = time.time()
+# ── TIMEOUT WRAPPER ───────────────────────────────────────────────────────────
+
+def _fetch_with_timeout(func, timeout: int = FETCH_TIMEOUT):
+    """
+    Run func() in a thread. Return result or None if it exceeds timeout.
+    Prevents yfinance hangs from freezing the entire Streamlit app.
+    """
+    result = [None]
+    error  = [None]
+
+    def target():
+        try:
+            result[0] = func()
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        print(f"[data_fetcher] Timeout after {timeout}s")
+        return None
+    if error[0]:
+        print(f"[data_fetcher] Fetch error: {error[0]}")
+        return None
+    return result[0]
 
 
-def _load(key: str):
+# ── CACHE HELPERS ─────────────────────────────────────────────────────────────
+
+def _cache_valid() -> bool:
+    last = st.session_state.get("data_fetch_ts", 0)
+    return (time.time() - last) < CACHE_TTL
+
+
+def _store_cache(key: str, data):
+    st.session_state[key] = data
+
+
+def _load_cache(key: str):
     return st.session_state.get(key)
 
 
-# ── BATCH FETCH ───────────────────────────────────────────────────────────────
+# ── SINGLE TICKER FETCH ───────────────────────────────────────────────────────
+
+def _fetch_ticker(label: str) -> Tuple[Optional[pd.DataFrame],
+                                        Optional[pd.DataFrame],
+                                        Optional[pd.DataFrame]]:
+    """
+    Fetch 5m, 1h, and 1d data for one ticker.
+    Returns (df_5m, df_1h, df_1d) — any can be None on failure.
+    """
+    yfticker = NAS100_YF if label == NAS100_LABEL else label
+
+    def get_5m():
+        df = yf.Ticker(yfticker).history(
+            period="5d", interval="5m", prepost=True
+        ).ffill().bfill()
+        return df if not df.empty else None
+
+    def get_1h():
+        df = yf.Ticker(yfticker).history(
+            period="60d", interval="1h"
+        ).ffill().bfill()
+        return df if not df.empty else None
+
+    def get_1d():
+        df = yf.Ticker(yfticker).history(
+            period="365d", interval="1d"
+        ).ffill().bfill()
+        return df if not df.empty else None
+
+    df_5m = _fetch_with_timeout(get_5m, FETCH_TIMEOUT)
+    df_1h = _fetch_with_timeout(get_1h, FETCH_TIMEOUT)
+    df_1d = _fetch_with_timeout(get_1d, FETCH_TIMEOUT)
+
+    return df_5m, df_1h, df_1d
+
+
+# ── VIX FETCH ─────────────────────────────────────────────────────────────────
+
+def _fetch_vix() -> Optional[float]:
+    def get():
+        df = yf.Ticker(VIX_YF).history(period="5d", interval="1d")
+        return float(df['Close'].iloc[-1]) if not df.empty else None
+    return _fetch_with_timeout(get, FETCH_TIMEOUT)
+
+
+# ── PARALLEL FETCH ALL ────────────────────────────────────────────────────────
 
 def fetch_all_data() -> bool:
     """
-    Master fetch function — call once per refresh cycle.
-    Downloads all price data in 3 batched calls and stores in session state.
-    Returns True if successful, False if data unavailable.
+    Fetch all tickers in parallel threads with timeouts.
+    Stores results in session_state. Returns True if at least some data loaded.
     """
-    if _cache_valid("prices_5m"):
-        return True   # cache still fresh, nothing to do
+    if _cache_valid():
+        return True   # cache still fresh
 
-    try:
-        tickers_str = " ".join(MAG7 + [NAS100_YF])
+    print(f"[data_fetcher] Starting parallel fetch for {len(ALL_LABELS)} tickers")
+    start = time.time()
 
-        # Batch call 1: 5-minute data for signals (all Mag7 + NAS100)
-        df_5m = yf.download(
-            tickers_str,
-            period="5d",
-            interval="5m",
-            group_by="ticker",
-            auto_adjust=True,
-            progress=False,
-            timeout=20,
-        )
+    results: Dict[str, Tuple] = {}
+    threads = []
 
-        # Batch call 2: 1-hour data for SMA200 + MACD (all Mag7 + NAS100)
-        df_1h = yf.download(
-            tickers_str,
-            period="60d",
-            interval="1h",
-            group_by="ticker",
-            auto_adjust=True,
-            progress=False,
-            timeout=20,
-        )
+    def fetch_and_store(label):
+        results[label] = _fetch_ticker(label)
 
-        # Batch call 3: daily data for IV rank/percentile + heatmap (all + VIX)
-        df_1d = yf.download(
-            " ".join(MAG7 + [NAS100_YF, VIX_YF]),
-            period="365d",
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=True,
-            progress=False,
-            timeout=20,
-        )
+    # Launch all fetches in parallel
+    for label in ALL_LABELS:
+        t = threading.Thread(target=fetch_and_store, args=(label,), daemon=True)
+        threads.append(t)
+        t.start()
 
-        _store("prices_5m", df_5m)
-        _store("prices_1h", df_1h)
-        _store("prices_1d", df_1d)
-        return True
+    # Also fetch VIX in parallel
+    vix_result = [None]
+    def fetch_vix_thread():
+        vix_result[0] = _fetch_vix()
+    vix_thread = threading.Thread(target=fetch_vix_thread, daemon=True)
+    vix_thread.start()
 
-    except Exception as e:
-        print(f"[data_fetcher] Batch fetch error: {e}")
-        return False
+    # Wait for all (max FETCH_TIMEOUT + 2s buffer)
+    for t in threads:
+        t.join(timeout=FETCH_TIMEOUT + 2)
+    vix_thread.join(timeout=FETCH_TIMEOUT + 2)
 
+    # Store results
+    any_success = False
+    for label, (df_5m, df_1h, df_1d) in results.items():
+        if df_5m is not None or df_1h is not None:
+            any_success = True
+        _store_cache(f"df_5m_{label}", df_5m)
+        _store_cache(f"df_1h_{label}", df_1h)
+        _store_cache(f"df_1d_{label}", df_1d)
 
-# ── DATA ACCESSORS ────────────────────────────────────────────────────────────
+    _store_cache("vix_value", vix_result[0])
 
-def get_5m(ticker: str) -> Optional[pd.DataFrame]:
-    """Get 5m OHLCV for a single ticker from the batched data."""
-    df = _load("prices_5m")
-    if df is None or df.empty:
-        return None
-    yfticker = NAS100_YF if ticker == 'NAS100' else ticker
-    try:
-        if isinstance(df.columns, pd.MultiIndex):
-            data = df[yfticker].copy() if yfticker in df.columns.get_level_values(0) else None
-            if data is None:
-                # Try ticker directly (sometimes no MultiIndex for single ticker)
-                data = df.copy()
-        else:
-            data = df.copy()
-        if data is not None:
-            data = data.ffill().bfill()
-            data.columns = [c.capitalize() for c in data.columns]
-        return data
-    except Exception as e:
-        print(f"[data_fetcher] get_5m error {ticker}: {e}")
-        return None
+    if any_success:
+        st.session_state["data_fetch_ts"] = time.time()
+        print(f"[data_fetcher] Fetch complete in {time.time()-start:.1f}s")
+
+    return any_success
 
 
-def get_1h(ticker: str) -> Optional[pd.DataFrame]:
-    """Get 1h OHLCV for a single ticker from the batched data."""
-    df = _load("prices_1h")
-    if df is None or df.empty:
-        return None
-    yfticker = NAS100_YF if ticker == 'NAS100' else ticker
-    try:
-        if isinstance(df.columns, pd.MultiIndex):
-            data = df[yfticker].copy() if yfticker in df.columns.get_level_values(0) else None
-            if data is None:
-                data = df.copy()
-        else:
-            data = df.copy()
-        if data is not None:
-            data = data.ffill().bfill()
-            data.columns = [c.capitalize() for c in data.columns]
-        return data
-    except Exception as e:
-        print(f"[data_fetcher] get_1h error {ticker}: {e}")
-        return None
+# ── PUBLIC ACCESSORS ──────────────────────────────────────────────────────────
 
+def get_5m(label: str) -> Optional[pd.DataFrame]:
+    return _load_cache(f"df_5m_{label}")
 
-def get_1d(ticker: str) -> Optional[pd.DataFrame]:
-    """Get daily OHLCV for a single ticker from the batched data."""
-    df = _load("prices_1d")
-    if df is None or df.empty:
-        return None
-    yfticker = NAS100_YF if ticker == 'NAS100' else ticker
-    try:
-        if isinstance(df.columns, pd.MultiIndex):
-            data = df[yfticker].copy() if yfticker in df.columns.get_level_values(0) else None
-            if data is None:
-                data = df.copy()
-        else:
-            data = df.copy()
-        if data is not None:
-            data = data.ffill().bfill()
-            data.columns = [c.capitalize() for c in data.columns]
-        return data
-    except Exception as e:
-        print(f"[data_fetcher] get_1d error {ticker}: {e}")
-        return None
+def get_1h(label: str) -> Optional[pd.DataFrame]:
+    return _load_cache(f"df_1h_{label}")
 
+def get_1d(label: str) -> Optional[pd.DataFrame]:
+    return _load_cache(f"df_1d_{label}")
 
 def get_vix() -> Optional[float]:
-    """Get latest VIX close from batched daily data."""
-    df = get_1d('VIX')
-    if df is None or df.empty:
-        return None
-    try:
-        return float(df['Close'].iloc[-1])
-    except Exception:
-        return None
+    return _load_cache("vix_value")
