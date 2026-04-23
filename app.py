@@ -67,6 +67,35 @@ def get_bs_delta(S, K, T, r, sigma):
 # ── HEATMAP ───────────────────────────────────────────────────────────────────
 def render_heatmap():
     st.subheader("📊 NAS100 + Mag 7 Hourly Heatmap")
+
+    # Market status indicator
+    from datetime import datetime, timezone, timedelta
+    ny_time = datetime.now(timezone(timedelta(hours=-4)))  # EDT (UTC-4)
+    ny_hour, ny_min = ny_time.hour, ny_time.minute
+    ny_weekday = ny_time.weekday()  # 0=Mon, 6=Sun
+    ny_time_str = ny_time.strftime("%H:%M NY time")
+
+    if ny_weekday >= 5:
+        market_status = f"🔴 Market CLOSED (Weekend) · {ny_time_str}"
+        status_color  = "error"
+    elif (ny_hour == 9 and ny_min >= 30) or (10 <= ny_hour < 16):
+        market_status = f"🟢 Market OPEN — Live data · {ny_time_str}"
+        status_color  = "success"
+    elif ny_hour < 9 or (ny_hour == 9 and ny_min < 30):
+        opens_in = (9 * 60 + 30) - (ny_hour * 60 + ny_min)
+        market_status = f"🟡 Pre-Market — Opens in {opens_in}min · Showing yesterday's closes · {ny_time_str}"
+        status_color  = "warning"
+    else:
+        market_status = f"🔴 After-Market CLOSED · {ny_time_str}"
+        status_color  = "error"
+
+    if status_color == "success":
+        st.success(market_status)
+    elif status_color == "warning":
+        st.warning(market_status)
+    else:
+        st.error(market_status)
+
     st.caption("Hourly % returns · Green = up · Red = down · Intensity = magnitude")
 
     rows = []
