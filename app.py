@@ -30,6 +30,32 @@ st.caption(
 
 NAS100_LABEL = 'NAS100'
 
+
+def _claude_allowed_stocks() -> tuple[bool, str]:
+    """
+    Gate Claude calls to NY market hours only.
+    Returns (allowed: bool, reason: str)
+    """
+    from datetime import datetime, timezone, timedelta
+    utc   = datetime.now(timezone.utc)
+    # NYSE: 14:30–21:00 UTC
+    start = utc.replace(hour=14, minute=30, second=0, microsecond=0)
+    end   = utc.replace(hour=21, minute=0,  second=0, microsecond=0)
+    wday  = utc.weekday()
+
+    if wday >= 5:
+        return False, "🔴 Weekend — market closed"
+    if utc < start:
+        mins = int((start - utc).total_seconds() / 60)
+        return False, f"🕐 NY opens in {mins} min — Claude activates at 14:30 UTC (17:30 Nairobi)"
+    if utc > end:
+        return False, "🔴 NY market closed — Claude resumes tomorrow at 14:30 UTC"
+    # First 90 min = prime time, after that only strong signals
+    prime_end = utc.replace(hour=16, minute=0, second=0, microsecond=0)
+    if utc <= prime_end:
+        return True, "🟢 NY Open — Prime Time (Claude ACTIVE)"
+    return True, "🟡 NY Mid-Session (Claude active on strong signals only)"
+
 # ── DATA FETCH (parallel with timeouts — never freezes) ──────────────────────
 import time as _time
 fetch_start = _time.time()
@@ -315,6 +341,22 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
         if ind["signal"] != "⚪ Neutral":
             with st.expander("🤖 Claude AI Analysis", expanded=True):
                 trade_allowed, trade_reason = check_trade_allowed(risk_config, ind["label"])
+
+                # Session gate — only call Claude during NY hours
+                session_ok, session_msg = _claude_allowed_stocks()
+
+                # During mid-session (after 16:00 UTC), only fire on STRONG signals
+                from datetime import datetime, timezone
+                utc_now = datetime.now(timezone.utc)
+                mid_session = utc_now.hour >= 16
+                weak_signal = "Caution" in ind["signal"] or "Overbought" in ind["signal"]
+                if session_ok and mid_session and weak_signal:
+                    session_ok  = False
+                    session_msg = "🟡 Mid-session — Claude only fires on STRONG signals"
+
+                if not session_ok:
+                    st.caption(session_msg)
+                    # Still show the signal text but skip the API call
 
                 iv     = ind.get('iv')
                 iv_str = (
