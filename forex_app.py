@@ -125,7 +125,7 @@ def render_correlation_matrix():
             else:           return "background-color:#5c1a1a;color:white"
         except: return ""
 
-    styled = corr.style.applymap(color_corr).format("{:.2f}")
+    styled = corr.style.map(color_corr).format("{:.2f}")
     st.dataframe(styled, use_container_width=True)
     st.caption("🟢 Strong positive correlation (pairs move together) · 🔴 Strong negative (inverse pairs)")
     st.divider()
@@ -180,8 +180,8 @@ if summary_rows:
 
     styled = (
         df_summary.style
-        .applymap(color_signal, subset=["Signal"])
-        .applymap(color_day,    subset=["Day %"])
+        .map(color_signal, subset=["Signal"])
+        .map(color_day,    subset=["Day %"])
     )
     st.dataframe(styled, use_container_width=True, height=300)
 
