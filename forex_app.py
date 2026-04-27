@@ -9,6 +9,45 @@ from forex_data_fetcher import fetch_all_pairs, get_1h, get_4h, get_1d, get_pip,
 from forex_volume_profile import compute_volume_profile, VolumeProfile
 from forex_analyst import analyse_pair, FXSignal
 
+# ── SESSION GATE ─────────────────────────────────────────────────────────────
+
+def _claude_allowed_forex() -> tuple[bool, str]:
+    """
+    Gate Claude calls to London Open and London/NY Overlap only.
+    Returns (allowed: bool, reason: str)
+    """
+    from datetime import datetime, timezone
+    utc  = datetime.now(timezone.utc)
+    h    = utc.hour
+    wday = utc.weekday()
+
+    if wday >= 5:
+        return False, "🔴 Forex weekend — Claude resumes Monday 07:00 UTC"
+
+    # London Open: 07:00–12:00 UTC
+    if 7 <= h < 12:
+        return True, "🟢 London Open — Claude ACTIVE (prime session)"
+
+    # London/NY Overlap: 12:00–17:00 UTC (peak liquidity)
+    if 12 <= h < 17:
+        return True, "🟢 London/NY Overlap — Claude ACTIVE (peak liquidity)"
+
+    # NY only: 17:00–21:00 UTC — USD pairs only
+    if 17 <= h < 21:
+        return True, "🟡 NY Session — Claude active (USD pairs priority)"
+
+    # Outside active sessions
+    if h < 7:
+        mins_to_london = (7 - h) * 60 - utc.minute
+        return False, f"🕐 Asian Session — Claude activates at London Open in {mins_to_london}min (07:00 UTC)"
+
+    return False, "🔴 After-hours — Claude resumes at London Open (07:00 UTC)"
+
+
+def _is_usd_pair(pair: str) -> bool:
+    return 'USD' in pair
+
+
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="FX Major Pairs Monitor", layout="wide", page_icon="💱")
 st_autorefresh(interval=60000, key="fx_refresh")
@@ -255,23 +294,37 @@ for idx, pair in enumerate(PAIRS):
         if should_analyse:
             with st.expander("🤖 Claude AI Analysis", expanded=True):
 
-                # Risk checks
-                trade_allowed = True
-                block_reason  = ""
-                if st.session_state.fx_kill:
-                    trade_allowed = False; block_reason = "🔴 Kill switch ON"
-                elif st.session_state.fx_open_pair and st.session_state.fx_open_pair != pair:
-                    trade_allowed = False; block_reason = f"⚠️ Position open on {st.session_state.fx_open_pair}"
-                elif st.session_state.fx_trades_today >= 3:
-                    trade_allowed = False; block_reason = "⚠️ Max 3 trades/day reached"
-                elif abs(min(st.session_state.fx_daily_pnl, 0)) / account_size * 100 >= daily_limit:
-                    trade_allowed = False; block_reason = "🔴 Daily loss limit reached"
+                # Session gate
+                session_ok, session_msg = _claude_allowed_forex()
 
-                ai: FXSignal = analyse_pair(vp, lot_size, account_size)
+                # During NY-only session, skip non-USD pairs to save tokens
+                from datetime import datetime, timezone
+                utc_now = datetime.now(timezone.utc)
+                if session_ok and 17 <= utc_now.hour < 21 and not _is_usd_pair(pair):
+                    session_ok  = False
+                    session_msg = f"🟡 NY Session — skipping {pair} (not a USD pair)"
 
-                if ai is None:
-                    st.info("ℹ️ Signal not yet actionable — Claude monitoring.")
+                if not session_ok:
+                    st.caption(session_msg)
+                    ai = None
                 else:
+                    # Risk checks
+                    trade_allowed = True
+                    block_reason  = ""
+                    if st.session_state.fx_kill:
+                        trade_allowed = False; block_reason = "🔴 Kill switch ON"
+                    elif st.session_state.fx_open_pair and st.session_state.fx_open_pair != pair:
+                        trade_allowed = False; block_reason = f"⚠️ Position open on {st.session_state.fx_open_pair}"
+                    elif st.session_state.fx_trades_today >= 3:
+                        trade_allowed = False; block_reason = "⚠️ Max 3 trades/day reached"
+                    elif abs(min(st.session_state.fx_daily_pnl, 0)) / account_size * 100 >= daily_limit:
+                        trade_allowed = False; block_reason = "🔴 Daily loss limit reached"
+
+                    ai: FXSignal = analyse_pair(vp, lot_size, account_size)
+
+                if ai is None and session_ok:
+                    st.info("ℹ️ Signal not yet actionable — Claude monitoring.")
+                elif ai is not None:
                     # CB sentiment badge
                     cb_color = {"HAWKISH":"green","DOVISH":"red","NEUTRAL":"gray"}.get(ai.cb_sentiment,"gray")
                     st.markdown(
