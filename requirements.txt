@@ -1,9 +1,15 @@
+# --- DASHBOARD CORE ---
 streamlit
-yfinance
+streamlit-autorefresh
 pandas
 numpy
 scipy
-streamlit-autorefresh
-anthropic
-# MetaTrader5 is Windows-only — only install on local Windows machine, NOT on Streamlit Cloud
+
+# --- DATA FETCHING ---
+yfinance
+
+# --- AI ENGINE ---
+google-generativeai
+
+# --- TRADING (Windows Only - Local) ---
 # MetaTrader5
