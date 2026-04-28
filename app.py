@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from scipy.stats import norm
 from streamlit_autorefresh import st_autorefresh
+from datetime import datetime, timezone
 
 from data_fetcher import fetch_all_data, get_5m, get_1h, get_1d, get_vix, get_heatmap_data, get_qqq_ndx_ratio, MAG7
 from iv_calculator import get_iv_data
@@ -31,55 +32,29 @@ st.caption(
 NAS100_LABEL = 'NAS100'
 
 
-def _claude_allowed_stocks() -> tuple[bool, str]:
+# ── SESSION GATE ──────────────────────────────────────────────────────────────
+def _claude_allowed_stocks() -> tuple:
     """
     Gate Claude calls to NY market hours only.
-    Returns (allowed: bool, reason: str)
+    Saves API costs outside trading hours.
+    Returns (allowed: bool, reason: str, prime_time: bool)
     """
-    from datetime import datetime, timezone, timedelta
     utc   = datetime.now(timezone.utc)
-    # NYSE: 14:30–21:00 UTC
     start = utc.replace(hour=14, minute=30, second=0, microsecond=0)
     end   = utc.replace(hour=21, minute=0,  second=0, microsecond=0)
+    prime = utc.replace(hour=16, minute=0,  second=0, microsecond=0)
     wday  = utc.weekday()
 
     if wday >= 5:
-        return False, "🔴 Weekend — market closed"
+        return False, "🔴 Weekend — Claude resumes Monday 14:30 UTC", False
     if utc < start:
         mins = int((start - utc).total_seconds() / 60)
-        return False, f"🕐 NY opens in {mins} min — Claude activates at 14:30 UTC (17:30 Nairobi)"
+        return False, f"🕐 Claude activates at NY Open in {mins} min (14:30 UTC / 17:30 Nairobi)", False
     if utc > end:
-        return False, "🔴 NY market closed — Claude resumes tomorrow at 14:30 UTC"
-    # First 90 min = prime time, after that only strong signals
-    prime_end = utc.replace(hour=16, minute=0, second=0, microsecond=0)
-    if utc <= prime_end:
-        return True, "🟢 NY Open — Prime Time (Claude ACTIVE)"
-    return True, "🟡 NY Mid-Session (Claude active on strong signals only)"
-
-# ── DATA FETCH (parallel with timeouts — never freezes) ──────────────────────
-import time as _time
-fetch_start = _time.time()
-
-with st.spinner("Fetching market data..."):
-    data_ok = fetch_all_data()
-
-fetch_elapsed = _time.time() - fetch_start
-
-if not data_ok:
-    # Check if we have stale cached data to show instead of blank screen
-    has_stale = any(
-        st.session_state.get(f"df_5m_{t}") is not None
-        for t in (['NAS100'] + ['AAPL','MSFT','GOOGL','AMZN','TSLA','META','NVDA'])
-    )
-    if has_stale:
-        st.warning("⚠️ Live data fetch failed — showing last known prices. Retrying next refresh.")
-    else:
-        st.error("⚠️ No market data available. Market may be closed or yfinance is rate-limited.")
-        st.stop()
-elif fetch_elapsed > 15:
-    st.caption(f"⏱️ Data loaded in {fetch_elapsed:.0f}s (slow connection)")
-
-vix_value = get_vix()
+        return False, "🔴 NY closed — Claude resumes tomorrow 14:30 UTC", False
+    if utc <= prime:
+        return True, "🟢 NY Open — Prime Time · Claude ACTIVE", True
+    return True, "🟡 NY Mid-Session · Claude active (strong signals only)", False
 
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -90,110 +65,105 @@ def get_bs_delta(S, K, T, r, sigma):
     return norm.cdf(d1)
 
 
+# ── DATA FETCH ────────────────────────────────────────────────────────────────
+import time as _time
+fetch_start = _time.time()
+with st.spinner("Fetching market data..."):
+    data_ok = fetch_all_data()
+fetch_elapsed = _time.time() - fetch_start
+
+if not data_ok:
+    has_stale = any(
+        st.session_state.get(f"df_5m_{t}") is not None
+        for t in ([NAS100_LABEL] + MAG7)
+    )
+    if has_stale:
+        st.warning("⚠️ Live fetch failed — showing last known prices. Retrying next refresh.")
+    else:
+        st.error("⚠️ No market data available. Market may be closed or yfinance is rate-limited.")
+        st.stop()
+elif fetch_elapsed > 15:
+    st.caption(f"⏱️ Data loaded in {fetch_elapsed:.0f}s")
+
+vix_value = get_vix()
+
+
 # ── HEATMAP ───────────────────────────────────────────────────────────────────
 def render_heatmap():
     st.subheader("📊 NAS100 + Mag 7 Hourly Heatmap")
 
-    # Market status indicator
-    from datetime import datetime, timezone, timedelta
-    ny_time = datetime.now(timezone(timedelta(hours=-4)))  # EDT (UTC-4)
-    ny_hour, ny_min = ny_time.hour, ny_time.minute
-    ny_weekday = ny_time.weekday()  # 0=Mon, 6=Sun
-    ny_time_str = ny_time.strftime("%H:%M NY time")
+    # Market status
+    utc      = datetime.now(timezone.utc)
+    ny_hour  = (utc.hour - 4) % 24
+    ny_wday  = utc.weekday()
+    ny_str   = f"{ny_hour:02d}:{utc.minute:02d} NY time"
 
-    if ny_weekday >= 5:
-        market_status = f"🔴 Market CLOSED (Weekend) · {ny_time_str}"
-        status_color  = "error"
-    elif (ny_hour == 9 and ny_min >= 30) or (10 <= ny_hour < 16):
-        market_status = f"🟢 Market OPEN — Live data · {ny_time_str}"
-        status_color  = "success"
-    elif ny_hour < 9 or (ny_hour == 9 and ny_min < 30):
-        opens_in = (9 * 60 + 30) - (ny_hour * 60 + ny_min)
-        market_status = f"🟡 Pre-Market — Opens in {opens_in}min · Showing yesterday's closes · {ny_time_str}"
-        status_color  = "warning"
+    if ny_wday >= 5:
+        st.error(f"🔴 Market CLOSED (Weekend) · {ny_str}")
+    elif (ny_hour == 9 and utc.minute >= 30) or (10 <= ny_hour < 16):
+        st.success(f"🟢 Market OPEN — Live data · {ny_str}")
+    elif ny_hour < 9 or (ny_hour == 9 and utc.minute < 30):
+        opens_in = (9 * 60 + 30) - (ny_hour * 60 + utc.minute)
+        st.warning(f"🟡 Pre-Market — Opens in {opens_in}min · Showing last session data · {ny_str}")
     else:
-        market_status = f"🔴 After-Market CLOSED · {ny_time_str}"
-        status_color  = "error"
-
-    if status_color == "success":
-        st.success(market_status)
-    elif status_color == "warning":
-        st.warning(market_status)
-    else:
-        st.error(market_status)
+        st.error(f"🔴 After-Market CLOSED · {ny_str}")
 
     st.caption("Hourly % returns · Green = up · Red = down · Intensity = magnitude")
 
     rows = []
-    all_labels = [NAS100_LABEL] + MAG7
-
-    for label in all_labels:
-        df = get_heatmap_data(label)   # uses 1h data from cache
+    for label in [NAS100_LABEL] + MAG7:
+        df = get_heatmap_data(label)
         if df is None or df.empty:
             continue
         try:
-            # Normalise column names
             df.columns = [c.capitalize() for c in df.columns]
             if 'Close' not in df.columns:
                 continue
-
-            # Use last 8 hourly candles for intraday view
             closes      = df['Close'].dropna().tail(8)
             if len(closes) < 2:
                 continue
-
             pct_changes = closes.pct_change().dropna() * 100
-            display_label = "NAS100(QQQ)" if label == NAS100_LABEL else label
-            row = {"Ticker": display_label, "Price": round(float(closes.iloc[-1]), 2)}
-
+            row = {"Ticker": "NAS100(QQQ)" if label == NAS100_LABEL else label,
+                   "Price":  round(float(closes.iloc[-1]), 2)}
             for j, (_, val) in enumerate(pct_changes.items()):
                 row[f"H{j+1}"] = round(float(val), 2)
-
-            # Day % = first to last close in the window
-            row["Day %"] = round(
-                float((closes.iloc[-1] - closes.iloc[0]) / closes.iloc[0] * 100), 2
-            )
+            row["Day %"] = round(float(
+                (closes.iloc[-1] - closes.iloc[0]) / closes.iloc[0] * 100), 2)
             rows.append(row)
-
         except Exception as e:
             print(f"[heatmap] {label}: {e}")
 
     if not rows:
-        st.warning("Heatmap data unavailable — market may be closed or data still loading.")
+        st.warning("Heatmap data unavailable — market may be closed.")
         return
 
     df_hm     = pd.DataFrame(rows).set_index("Ticker")
     hour_cols = sorted([c for c in df_hm.columns if c.startswith("H")])
-
-    # Fill missing hour columns with 0
     for h in hour_cols:
         df_hm[h] = pd.to_numeric(df_hm[h], errors='coerce').fillna(0)
     df_hm["Day %"] = pd.to_numeric(df_hm["Day %"], errors='coerce').fillna(0)
 
     def color_cell(val):
         try:
-            val = float(val)
-        except (TypeError, ValueError):
+            v = float(val)
+        except:
             return ""
-        if val > 1.5:    return "background-color:#1a7a1a;color:white"
-        elif val > 0.5:  return "background-color:#2d9e2d;color:white"
-        elif val > 0.1:  return "background-color:#5cb85c;color:white"
-        elif val > -0.1: return "background-color:#888;color:white"
-        elif val > -0.5: return "background-color:#d9534f;color:white"
-        elif val > -1.5: return "background-color:#c9302c;color:white"
-        else:            return "background-color:#8b0000;color:white"
+        if v > 1.5:    return "background-color:#1a7a1a;color:white"
+        elif v > 0.5:  return "background-color:#2d9e2d;color:white"
+        elif v > 0.1:  return "background-color:#5cb85c;color:white"
+        elif v > -0.1: return "background-color:#888;color:white"
+        elif v > -0.5: return "background-color:#d9534f;color:white"
+        elif v > -1.5: return "background-color:#c9302c;color:white"
+        else:          return "background-color:#8b0000;color:white"
 
-    cols_to_color = ["Day %"] + hour_cols
     fmt = {"Price": "${:,.2f}", "Day %": "{:+.2f}%"}
     fmt.update({h: "{:+.2f}%" for h in hour_cols})
 
     styled = (
         df_hm[["Price", "Day %"] + hour_cols]
-        .style
-        .map(color_cell, subset=cols_to_color)
+        .style.map(color_cell, subset=["Day %"] + hour_cols)
         .format(fmt)
     )
-
     st.dataframe(styled, use_container_width=True, height=320)
     st.divider()
 
@@ -213,15 +183,15 @@ def compute_indicators(label: str):
     curr_p       = df_5m['Close'].iloc[-1]
     prev_p       = df_5m['Close'].iloc[-2]
 
-    # Scale QQQ price to NAS100 index value using live ratio
+    # Scale QQQ → NAS100 index price
     if label == NAS100_LABEL:
-        ratio     = get_qqq_ndx_ratio()   # live ^NDX / QQQ ratio
+        ratio     = get_qqq_ndx_ratio()
         curr_p    = round(curr_p    * ratio, 0)
         prev_p    = round(prev_p    * ratio, 0)
         sma200_1h = round(sma200_1h * ratio, 0)
 
     trend_status = "BULLISH" if curr_p > sma200_1h else "BEARISH"
-    trend_color  = "green" if trend_status == "BULLISH" else "red"
+    trend_color  = "green"   if trend_status == "BULLISH" else "red"
 
     ema12        = df_1h['Close'].ewm(span=12, adjust=False).mean()
     ema26        = df_1h['Close'].ewm(span=26, adjust=False).mean()
@@ -229,14 +199,14 @@ def compute_indicators(label: str):
     signal_line  = macd_line.ewm(span=9, adjust=False).mean()
     macd_bullish = macd_line.iloc[-1] > signal_line.iloc[-1]
 
-    delta_p = df_5m['Close'].diff()
-    gain    = (delta_p.where(delta_p > 0, 0)).rolling(window=14).mean()
-    loss    = (-delta_p.where(delta_p < 0, 0)).rolling(window=14).mean()
-    rs      = gain / loss
+    delta_p    = df_5m['Close'].diff()
+    gain       = (delta_p.where(delta_p > 0, 0)).rolling(window=14).mean()
+    loss       = (-delta_p.where(delta_p < 0, 0)).rolling(window=14).mean()
+    rs         = gain / loss
     rsi_series = 100 - (100 / (1 + rs))
     rsi        = rsi_series.iloc[-1]
 
-    df_5m = df_5m.copy()
+    df_5m      = df_5m.copy()
     df_5m['vol_ma_long']  = df_5m['Volume'].rolling(window=20).mean()
     df_5m['vol_ma_short'] = df_5m['Volume'].rolling(window=5).mean()
     vol_ratio = (
@@ -248,53 +218,37 @@ def compute_indicators(label: str):
     ann_vol     = df_5m['Close'].pct_change().std() * np.sqrt(252 * 78)
     delta_val   = get_bs_delta(curr_p, start_price, 1/252, 0.045, ann_vol)
 
-    # ── SIGNAL LOGIC ─────────────────────────────────────────────────────────
-    # RSI momentum: rate of change over last 5 candles
-    rsi_series  = 100 - (100 / (1 + gain / loss))
-    rsi_prev    = rsi_series.iloc[-6] if len(rsi_series) >= 6 else rsi
-    rsi_rising  = rsi > rsi_prev
-    rsi_falling = rsi < rsi_prev
+    # RSI momentum
+    rsi_prev   = rsi_series.iloc[-6] if len(rsi_series) >= 6 else rsi
+    rsi_rising = rsi > rsi_prev
+    rsi_falling= rsi < rsi_prev
+    price_mom  = (curr_p - df_5m['Close'].iloc[-13]) / df_5m['Close'].iloc[-13] * 100 if len(df_5m) >= 13 else 0
 
-    # Price momentum: % change over last 12 candles (~1hr on 5m chart)
-    price_mom = (curr_p - df_5m['Close'].iloc[-13]) / df_5m['Close'].iloc[-13] * 100 if len(df_5m) >= 13 else 0
-
-    # ── MODE 1: DIP BUY — oversold pullback inside uptrend ───────────────────
+    # Signal logic
     if curr_p > sma200_1h and rsi < 40 and vol_ratio > 1.1 and macd_bullish:
         signal    = "🟢 STRONG BUY — Dip (Full Confluence)"
         sig_color = "green"
-
-    # ── MODE 2: MOMENTUM BUY — breakout surge with volume ────────────────────
     elif (curr_p > sma200_1h and rsi > 60 and rsi < 80
           and rsi_rising and vol_ratio > 1.3 and macd_bullish and price_mom > 0.3):
         signal    = "🚀 MOMENTUM BUY — Breakout"
         sig_color = "green"
-
-    # ── MODE 3: STRONG SELL — breakdown below SMA200 ─────────────────────────
     elif curr_p < sma200_1h and rsi > 60 and vol_ratio > 1.1 and not macd_bullish:
         signal    = "🔴 STRONG SELL (Full Confluence)"
         sig_color = "red"
-
-    # ── MODE 4: MOMENTUM SELL — collapse with volume ──────────────────────────
     elif (curr_p < sma200_1h and rsi < 40 and rsi > 20
           and rsi_falling and vol_ratio > 1.3 and not macd_bullish and price_mom < -0.3):
         signal    = "💥 MOMENTUM SELL — Breakdown"
         sig_color = "red"
-
-    # ── MODE 5: CAUTION BUY — partial setup, missing MACD ────────────────────
     elif curr_p > sma200_1h and rsi < 35:
         signal    = "🟡 Caution Buy (No MACD Confirm)"
         sig_color = "orange"
-
-    # ── MODE 6: OVERBOUGHT WARNING — rally may be exhausted ──────────────────
     elif curr_p > sma200_1h and rsi > 75 and vol_ratio < 0.8:
         signal    = "⚠️ Overbought — Watch for Reversal"
         sig_color = "orange"
-
     else:
         signal    = "⚪ Neutral"
         sig_color = "gray"
 
-    # IV — uses batched daily data, no extra fetch
     iv = get_iv_data(label, curr_p, df_1d, vix_value)
 
     return dict(
@@ -340,103 +294,101 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
 
         if ind["signal"] != "⚪ Neutral":
             with st.expander("🤖 Claude AI Analysis", expanded=True):
-                trade_allowed, trade_reason = check_trade_allowed(risk_config, ind["label"])
 
-                # Session gate — only call Claude during NY hours
-                session_ok, session_msg = _claude_allowed_stocks()
+                # ── SESSION GATE ──────────────────────────────────────────────
+                session_ok, session_msg, prime_time = _claude_allowed_stocks()
 
-                # During mid-session (after 16:00 UTC), only fire on STRONG signals
-                from datetime import datetime, timezone
-                utc_now = datetime.now(timezone.utc)
-                mid_session = utc_now.hour >= 16
-                weak_signal = "Caution" in ind["signal"] or "Overbought" in ind["signal"]
-                if session_ok and mid_session and weak_signal:
-                    session_ok  = False
-                    session_msg = "🟡 Mid-session — Claude only fires on STRONG signals"
+                # Mid-session: only fire on STRONG/MOMENTUM signals
+                if session_ok and not prime_time:
+                    weak = any(w in ind["signal"] for w in ["Caution", "Overbought"])
+                    if weak:
+                        session_ok  = False
+                        session_msg = "🟡 Mid-session — Claude fires on STRONG signals only"
 
                 if not session_ok:
                     st.caption(session_msg)
-                    # Still show the signal text but skip the API call
-
-                iv     = ind.get('iv')
-                iv_str = (
-                    f"{iv.current_iv:.1f}% (Rank {iv.iv_rank:.0f}/100, {iv.iv_label})"
-                    if iv else "unavailable"
-                )
-
-                ai = analyse(
-                    ticker=ind["label"],
-                    current_price=ind["curr_p"],
-                    raw_signal=ind["signal"],
-                    rsi=ind["rsi"],
-                    vol_ratio=ind["vol_ratio"],
-                    macd_bullish=ind["macd_bullish"],
-                    trend_status=ind["trend_status"],
-                    delta_val=ind["delta_val"],
-                    sma200=ind["sma200_1h"],
-                    account_balance=risk_config.account_size_usd,
-                    lot_size=risk_config.lot_size,
-                    implied_volatility=iv_str,
-                )
-
-                if ai is None:
-                    st.warning("Claude analysis unavailable — check API key.")
                 else:
-                    action_color = {"BUY":"green","SELL":"red","HOLD":"gray"}.get(ai.action,"gray")
-                    st.markdown(
-                        f"**Decision:** :{action_color}[{ai.action}] "
-                        f"| Confidence: **{ai.confidence}**"
+                    trade_allowed, trade_reason = check_trade_allowed(risk_config, ind["label"])
+
+                    iv     = ind.get('iv')
+                    iv_str = (
+                        f"{iv.current_iv:.1f}% (Rank {iv.iv_rank:.0f}/100, {iv.iv_label})"
+                        if iv else "unavailable"
                     )
-                    st.caption(f"📊 {ai.reasoning}")
-                    if ai.sentiment_summary:
-                        st.info(f"🗞️ {ai.sentiment_summary}")
 
-                    if ai.action != "HOLD":
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("Entry",       f"${ai.entry_price:,.2f}")
-                        c2.metric("Stop Loss",   f"${ai.stop_loss:,.2f}",
-                                  delta=f"{((ai.stop_loss-ai.entry_price)/ai.entry_price*100):+.2f}%",
-                                  delta_color="off")
-                        c3.metric("Take Profit", f"${ai.take_profit:,.2f}",
-                                  delta=f"{((ai.take_profit-ai.entry_price)/ai.entry_price*100):+.2f}%",
-                                  delta_color="off")
+                    ai = analyse(
+                        ticker=ind["label"],
+                        current_price=ind["curr_p"],
+                        raw_signal=ind["signal"],
+                        rsi=ind["rsi"],
+                        vol_ratio=ind["vol_ratio"],
+                        macd_bullish=ind["macd_bullish"],
+                        trend_status=ind["trend_status"],
+                        delta_val=ind["delta_val"],
+                        sma200=ind["sma200_1h"],
+                        account_balance=risk_config.account_size_usd,
+                        lot_size=risk_config.lot_size,
+                        implied_volatility=iv_str,
+                    )
 
-                        risk_usd   = abs(ai.entry_price - ai.stop_loss) * (ai.lot_size * 100)
-                        reward_usd = abs(ai.take_profit - ai.entry_price) * (ai.lot_size * 100)
-                        rr         = reward_usd / risk_usd if risk_usd > 0 else 0
-                        st.caption(
-                            f"Lot: {ai.lot_size} | Risk: ~${risk_usd:.2f} | "
-                            f"Reward: ~${reward_usd:.2f} | R:R = {rr:.1f}:1"
+                    if ai is None:
+                        st.warning("Claude analysis unavailable — check API key.")
+                    else:
+                        a_color = {"BUY":"green","SELL":"red","HOLD":"gray"}.get(ai.action,"gray")
+                        st.markdown(
+                            f"**Decision:** :{a_color}[{ai.action}] "
+                            f"| Confidence: **{ai.confidence}**"
                         )
+                        st.caption(f"📊 {ai.reasoning}")
+                        if ai.sentiment_summary:
+                            st.info(f"🗞️ {ai.sentiment_summary}")
 
-                        if trade_allowed:
-                            if st.button(
-                                f"⚡ Execute {ai.action} {ind['label']}",
-                                key=f"exec_{ind['label']}",
-                                type="primary",
-                            ):
-                                from broker import place_order
-                                result = place_order(
-                                    ticker=ind["label"],
-                                    action=ai.action,
-                                    stop_loss=ai.stop_loss,
-                                    take_profit=ai.take_profit,
-                                    lot_size=ai.lot_size,
-                                )
-                                if result.success:
-                                    record_trade_opened(
+                        if ai.action != "HOLD":
+                            c1, c2, c3 = st.columns(3)
+                            c1.metric("Entry",       f"${ai.entry_price:,.2f}")
+                            c2.metric("Stop Loss",   f"${ai.stop_loss:,.2f}",
+                                      delta=f"{((ai.stop_loss-ai.entry_price)/ai.entry_price*100):+.2f}%",
+                                      delta_color="off")
+                            c3.metric("Take Profit", f"${ai.take_profit:,.2f}",
+                                      delta=f"{((ai.take_profit-ai.entry_price)/ai.entry_price*100):+.2f}%",
+                                      delta_color="off")
+
+                            risk_usd   = abs(ai.entry_price - ai.stop_loss) * (ai.lot_size * 100)
+                            reward_usd = abs(ai.take_profit - ai.entry_price) * (ai.lot_size * 100)
+                            rr         = reward_usd / risk_usd if risk_usd > 0 else 0
+                            st.caption(
+                                f"Lot: {ai.lot_size} | Risk: ~${risk_usd:.2f} | "
+                                f"Reward: ~${reward_usd:.2f} | R:R = {rr:.1f}:1"
+                            )
+
+                            if trade_allowed:
+                                if st.button(
+                                    f"⚡ Execute {ai.action} {ind['label']}",
+                                    key=f"exec_{ind['label']}",
+                                    type="primary",
+                                ):
+                                    from broker import place_order
+                                    result = place_order(
                                         ticker=ind["label"],
                                         action=ai.action,
-                                        entry=result.filled_price or ai.entry_price,
-                                        sl=ai.stop_loss,
-                                        tp=ai.take_profit,
-                                        lots=ai.lot_size,
+                                        stop_loss=ai.stop_loss,
+                                        take_profit=ai.take_profit,
+                                        lot_size=ai.lot_size,
                                     )
-                                    st.success(result.message)
-                                else:
-                                    st.error(result.message)
-                        else:
-                            st.error(trade_reason)
+                                    if result.success:
+                                        record_trade_opened(
+                                            ticker=ind["label"],
+                                            action=ai.action,
+                                            entry=result.filled_price or ai.entry_price,
+                                            sl=ai.stop_loss,
+                                            tp=ai.take_profit,
+                                            lots=ai.lot_size,
+                                        )
+                                        st.success(result.message)
+                                    else:
+                                        st.error(result.message)
+                            else:
+                                st.error(trade_reason)
 
         st.divider()
 
