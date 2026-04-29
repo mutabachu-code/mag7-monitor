@@ -317,15 +317,13 @@ for idx, pair in enumerate(PAIRS):
                             st.info(f"🗞️ {ai.news_summary}")
 
                         if ai.action != "HOLD":
-                            e1, e2, e3 = st.columns(3)
-                            e1.metric("Entry",       f"{ai.entry:.5f}")
-                            e2.metric("Stop Loss",   f"{ai.stop_loss:.5f}",
-                                      delta=f"{ai.stop_pips:.1f} pips", delta_color="off")
-                            e3.metric("Take Profit", f"{ai.take_profit:.5f}",
-                                      delta=f"{ai.target_pips:.1f} pips", delta_color="off")
-
                             rr       = ai.target_pips / ai.stop_pips if ai.stop_pips > 0 else 0
                             risk_usd = ai.stop_pips * lot_size * 10
+                            st.write({
+                                "Level": ["Entry", "Stop Loss", "Take Profit"],
+                                "Price": [f"{ai.entry:.5f}", f"{ai.stop_loss:.5f}", f"{ai.take_profit:.5f}"],
+                                "Pips":  ["—", f"{ai.stop_pips:.1f}", f"{ai.target_pips:.1f}"],
+                            })
                             st.caption(
                                 f"R:R = {rr:.1f}:1 | Risk ~${risk_usd:.2f} | "
                                 f"Spread: {vp.spread_pips} pips"
