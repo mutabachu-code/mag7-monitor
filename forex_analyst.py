@@ -47,7 +47,8 @@ def _store_cache(pair: str, result: "FXSignal", signal: str):
 
 
 def analyse_pair(vp: VolumeProfile, lot_size: float = 0.02,
-                 account_balance: float = 100.0) -> Optional[FXSignal]:
+                 account_balance: float = 100.0,
+                 yield_context: str = "unavailable") -> Optional[FXSignal]:
 
     if _cache_valid(vp.pair, vp.signal):
         print(f"[forex_analyst] Cache hit {vp.pair} — no API call")
@@ -80,9 +81,18 @@ ATR               : {vp.atr:.5f} ({vp.atr_pct*100:.3f}%)
 === ACCOUNT ===
 Balance: ${account_balance:.2f} | Lot: {lot_size} | Spread: {vp.spread_pips} pips
 
+=== MACRO CONTEXT ===
+{yield_context}
+
 === TASK ===
 Using your knowledge of current {base_ccy} and {quote_ccy} central bank stance and recent macro:
 1. Is {base_ccy} central bank currently HAWKISH, DOVISH, or NEUTRAL?
+YIELD CONTEXT RULES (apply before deciding):
+- If 10Y Yield > 4.50% (YIELD TRAP): USD bullish bias — disable Mean Reversion SELL on USD pairs,
+  favour BREAKOUT BUY on USDJPY and USDCHF
+- If Risk Score >= 70 (DANGER): favour JPY and CHF safe-haven flows,
+  avoid BUY signals on risk currencies (AUDUSD, NZDUSD)
+- If CLEAR risk environment: normal signal logic applies
 2. Validate the Volume Profile signal
 3. Apply Central Bank Drift Rule: if extreme CB sentiment, disable counter-trend signals
 4. Calculate SL at nearest VA edge, TP at next HVN. Min 1.5:1 R:R.
