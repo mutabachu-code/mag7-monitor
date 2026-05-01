@@ -1,11 +1,17 @@
 """
-data_fetcher.py  —  v3
+data_fetcher.py  —  v4
 -----------------------
-Fetches market data with:
-- Individual yf.Ticker calls (more reliable than yf.download on Streamlit Cloud)
-- Hard 8-second timeout per ticker via threading
-- 65-second session cache — only fetches when cache expires
-- Never blocks the Streamlit thread
+Single data layer for the entire Mag7 + NAS100 dashboard.
+Fetches ALL instruments in one parallel batch with hard timeouts.
+
+Instruments covered:
+  - Mag 7 stocks:     AAPL MSFT GOOGL AMZN TSLA META NVDA
+  - NAS100 proxy:     QQQ  (^NDX for scaling ratio)
+  - Volatility:       ^VIX
+  - Macro:            ^TNX (10Y yield), BZ=F (Brent oil), QQQE (equal-weight Nasdaq)
+
+Before v4: 34 individual yfinance calls per refresh
+After  v4: 1 parallel batch, all results in session_state cache (65s TTL)
 """
 
 import yfinance as yf
@@ -14,212 +20,229 @@ import numpy as np
 import time
 import streamlit as st
 import threading
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
+# ── INSTRUMENT REGISTRY ───────────────────────────────────────────────────────
 MAG7         = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA']
 NAS100_LABEL = 'NAS100'
-NAS100_YF    = 'QQQ'   # QQQ ETF = reliable Nasdaq-100 proxy (^NDX often blocked by yfinance)
+NAS100_YF    = 'QQQ'        # reliable proxy; ^NDX often blocked on Linux
 VIX_YF       = '^VIX'
-ALL_LABELS   = [NAS100_LABEL] + MAG7
+NDX_YF       = '^NDX'       # only used for QQQ→NAS100 scaling ratio
+TNX_YF       = '^TNX'       # US 10Y Treasury yield
+OIL_YF       = 'BZ=F'       # Brent crude
+QQQE_YF      = 'QQQE'       # Equal-weight Nasdaq-100 (breadth indicator)
 
-CACHE_TTL    = 65    # seconds
-FETCH_TIMEOUT = 8   # seconds per ticker before giving up
+ALL_LABELS   = [NAS100_LABEL] + MAG7   # price card tickers
+
+# Macro instruments fetched separately (daily data only)
+MACRO_YF     = [TNX_YF, OIL_YF, QQQE_YF, NDX_YF, VIX_YF]
+
+CACHE_TTL    = 65    # seconds — slightly longer than 60s refresh
+FETCH_TIMEOUT = 10   # seconds per ticker before abandoning
 
 
 # ── TIMEOUT WRAPPER ───────────────────────────────────────────────────────────
 
-def _fetch_with_timeout(func, timeout: int = FETCH_TIMEOUT):
-    """
-    Run func() in a thread. Return result or None if it exceeds timeout.
-    Prevents yfinance hangs from freezing the entire Streamlit app.
-    """
+def _fetch_with_timeout(func, timeout=FETCH_TIMEOUT):
     result = [None]
-    error  = [None]
-
     def target():
         try:
             result[0] = func()
         except Exception as e:
-            error[0] = e
-
+            print(f"[data_fetcher] {e}")
     t = threading.Thread(target=target, daemon=True)
     t.start()
     t.join(timeout=timeout)
-
-    if t.is_alive():
-        print(f"[data_fetcher] Timeout after {timeout}s")
-        return None
-    if error[0]:
-        print(f"[data_fetcher] Fetch error: {error[0]}")
-        return None
     return result[0]
 
 
 # ── CACHE HELPERS ─────────────────────────────────────────────────────────────
 
 def _cache_valid() -> bool:
-    last = st.session_state.get("data_fetch_ts", 0)
-    return (time.time() - last) < CACHE_TTL
+    return (time.time() - st.session_state.get("data_fetch_ts", 0)) < CACHE_TTL
 
-
-def _store_cache(key: str, data):
+def _store(key, data):
     st.session_state[key] = data
 
-
-def _load_cache(key: str):
+def _load(key):
     return st.session_state.get(key)
 
 
-# ── SINGLE TICKER FETCH ───────────────────────────────────────────────────────
+# ── PRICE TICKER FETCH (5m + 1h + 1d) ────────────────────────────────────────
 
-def _fetch_ticker(label: str) -> Tuple[Optional[pd.DataFrame],
-                                        Optional[pd.DataFrame],
-                                        Optional[pd.DataFrame]]:
-    """
-    Fetch 5m, 1h, and 1d data for one ticker.
-    Returns (df_5m, df_1h, df_1d) — any can be None on failure.
-    """
+def _fetch_price_ticker(label: str) -> Tuple[Optional[pd.DataFrame],
+                                              Optional[pd.DataFrame],
+                                              Optional[pd.DataFrame]]:
     yfticker = NAS100_YF if label == NAS100_LABEL else label
 
     def get_5m():
-        df = yf.Ticker(yfticker).history(
-            period="5d", interval="5m", prepost=True
-        ).ffill().bfill()
+        df = yf.Ticker(yfticker).history(period="5d", interval="5m", prepost=True).ffill().bfill()
         return df if not df.empty else None
 
     def get_1h():
-        df = yf.Ticker(yfticker).history(
-            period="60d", interval="1h"
-        ).ffill().bfill()
+        df = yf.Ticker(yfticker).history(period="60d", interval="1h").ffill().bfill()
         return df if not df.empty else None
 
     def get_1d():
-        df = yf.Ticker(yfticker).history(
-            period="365d", interval="1d"
-        ).ffill().bfill()
+        df = yf.Ticker(yfticker).history(period="365d", interval="1d").ffill().bfill()
         return df if not df.empty else None
 
-    df_5m = _fetch_with_timeout(get_5m, FETCH_TIMEOUT)
-    df_1h = _fetch_with_timeout(get_1h, FETCH_TIMEOUT)
-    df_1d = _fetch_with_timeout(get_1d, FETCH_TIMEOUT)
+    return (
+        _fetch_with_timeout(get_5m, FETCH_TIMEOUT),
+        _fetch_with_timeout(get_1h, FETCH_TIMEOUT),
+        _fetch_with_timeout(get_1d, FETCH_TIMEOUT),
+    )
 
-    return df_5m, df_1h, df_1d
 
+# ── MACRO INSTRUMENT FETCH (daily only) ───────────────────────────────────────
 
-# ── VIX FETCH ─────────────────────────────────────────────────────────────────
-
-def _fetch_vix() -> Optional[float]:
+def _fetch_macro_instrument(symbol: str) -> Optional[pd.DataFrame]:
+    """Fetch daily data for a macro instrument (TNX, BZ=F, QQQE, NDX, VIX)."""
     def get():
-        df = yf.Ticker(VIX_YF).history(period="5d", interval="1d")
-        return float(df['Close'].iloc[-1]) if not df.empty else None
+        period = "30d" if symbol in [TNX_YF, QQQE_YF, NDX_YF] else "5d"
+        df = yf.Ticker(symbol).history(period=period, interval="1d").ffill().bfill()
+        return df if not df.empty else None
     return _fetch_with_timeout(get, FETCH_TIMEOUT)
 
 
-def _fetch_ndx_ratio() -> Optional[float]:
-    """
-    Fetch actual ^NDX close and QQQ close to compute live scaling ratio.
-    This way NAS100 display price stays accurate as ratio drifts over time.
-    """
-    def get():
-        ndx = yf.Ticker('^NDX').history(period="5d", interval="1d")
-        qqq = yf.Ticker('QQQ').history(period="5d", interval="1d")
-        if ndx.empty or qqq.empty:
-            return None
-        return float(ndx['Close'].iloc[-1]) / float(qqq['Close'].iloc[-1])
-    return _fetch_with_timeout(get, FETCH_TIMEOUT)
-
-
-# ── PARALLEL FETCH ALL ────────────────────────────────────────────────────────
+# ── MASTER FETCH ─────────────────────────────────────────────────────────────
 
 def fetch_all_data() -> bool:
     """
-    Fetch all tickers in parallel threads with timeouts.
-    Stores results in session_state. Returns True if at least some data loaded.
+    Fetch ALL instruments in a single parallel batch.
+    Stores everything in session_state. Returns True if at least some data loaded.
+
+    Call once per 60s refresh cycle — subsequent reads use cache.
     """
     if _cache_valid():
-        return True   # cache still fresh
+        return True
 
-    print(f"[data_fetcher] Starting parallel fetch for {len(ALL_LABELS)} tickers")
+    print(f"[data_fetcher] Parallel fetch: {len(ALL_LABELS)} price tickers + {len(MACRO_YF)} macro instruments")
     start = time.time()
 
-    results: Dict[str, Tuple] = {}
+    price_results = {}
+    macro_results = {}
     threads = []
 
-    def fetch_and_store(label):
-        results[label] = _fetch_ticker(label)
+    # Price tickers (5m + 1h + 1d)
+    def fetch_price(label):
+        price_results[label] = _fetch_price_ticker(label)
 
-    # Launch all fetches in parallel
     for label in ALL_LABELS:
-        t = threading.Thread(target=fetch_and_store, args=(label,), daemon=True)
+        t = threading.Thread(target=fetch_price, args=(label,), daemon=True)
         threads.append(t)
         t.start()
 
-    # Also fetch VIX and NDX ratio in parallel
-    vix_result   = [None]
-    ratio_result = [None]
+    # Macro instruments (1d only)
+    def fetch_macro(sym):
+        macro_results[sym] = _fetch_macro_instrument(sym)
 
-    def fetch_vix_thread():
-        vix_result[0] = _fetch_vix()
+    for sym in MACRO_YF:
+        t = threading.Thread(target=fetch_macro, args=(sym,), daemon=True)
+        threads.append(t)
+        t.start()
 
-    def fetch_ratio_thread():
-        ratio_result[0] = _fetch_ndx_ratio()
-
-    vix_thread   = threading.Thread(target=fetch_vix_thread,   daemon=True)
-    ratio_thread = threading.Thread(target=fetch_ratio_thread, daemon=True)
-    vix_thread.start()
-    ratio_thread.start()
-
-    # Wait for all (max FETCH_TIMEOUT + 2s buffer)
+    # Wait for all threads
     for t in threads:
         t.join(timeout=FETCH_TIMEOUT + 2)
-    vix_thread.join(timeout=FETCH_TIMEOUT + 2)
-    ratio_thread.join(timeout=FETCH_TIMEOUT + 2)
 
-    # Store results
+    # Store price data
     any_success = False
-    for label, (df_5m, df_1h, df_1d) in results.items():
+    for label, (df_5m, df_1h, df_1d) in price_results.items():
         if df_5m is not None or df_1h is not None:
             any_success = True
-        _store_cache(f"df_5m_{label}", df_5m)
-        _store_cache(f"df_1h_{label}", df_1h)
-        _store_cache(f"df_1d_{label}", df_1d)
+        _store(f"df_5m_{label}", df_5m)
+        _store(f"df_1h_{label}", df_1h)
+        _store(f"df_1d_{label}", df_1d)
 
-    _store_cache("vix_value",   vix_result[0])
-    # Store ratio with fallback of 40.0 if fetch fails
-    _store_cache("qqq_ndx_ratio", ratio_result[0] if ratio_result[0] else 40.0)
+    # Store macro data
+    for sym, df in macro_results.items():
+        key = {
+            TNX_YF:  "macro_tnx",
+            OIL_YF:  "macro_oil",
+            QQQE_YF: "macro_qqqe",
+            NDX_YF:  "macro_ndx",
+            VIX_YF:  "macro_vix",
+        }.get(sym, f"macro_{sym}")
+        _store(key, df)
+
+    # Compute QQQ→NAS100 scaling ratio from macro data
+    ndx_df = macro_results.get(NDX_YF)
+    qqq_5m = price_results.get(NAS100_LABEL, (None, None, None))[0]
+    ratio  = 40.0   # fallback
+    if ndx_df is not None and not ndx_df.empty:
+        ndx_close = float(ndx_df['Close'].iloc[-1])
+        # Get QQQ 1d close
+        qqq_1d = price_results.get(NAS100_LABEL, (None, None, None))[2]
+        if qqq_1d is not None and not qqq_1d.empty:
+            qqq_close = float(qqq_1d['Close'].iloc[-1])
+            if qqq_close > 0:
+                ratio = ndx_close / qqq_close
+    _store("qqq_ndx_ratio", ratio)
 
     if any_success:
         st.session_state["data_fetch_ts"] = time.time()
-        print(f"[data_fetcher] Fetch complete in {time.time()-start:.1f}s")
+        print(f"[data_fetcher] Complete in {time.time()-start:.1f}s | ratio={ratio:.1f}")
 
     return any_success
 
 
-# ── PUBLIC ACCESSORS ──────────────────────────────────────────────────────────
+# ── PUBLIC ACCESSORS — price data ─────────────────────────────────────────────
 
 def get_5m(label: str) -> Optional[pd.DataFrame]:
-    return _load_cache(f"df_5m_{label}")
+    return _load(f"df_5m_{label}")
 
 def get_1h(label: str) -> Optional[pd.DataFrame]:
-    return _load_cache(f"df_1h_{label}")
+    return _load(f"df_1h_{label}")
 
 def get_1d(label: str) -> Optional[pd.DataFrame]:
-    return _load_cache(f"df_1d_{label}")
-
-def get_vix() -> Optional[float]:
-    return _load_cache("vix_value")
+    return _load(f"df_1d_{label}")
 
 def get_qqq_ndx_ratio() -> float:
-    """Returns QQQ→NAS100 scaling ratio. Defaults to 40.0 if unavailable."""
-    return _load_cache("qqq_ndx_ratio") or 40.0
+    return _load("qqq_ndx_ratio") or 40.0
 
 def get_heatmap_data(label: str) -> Optional[pd.DataFrame]:
-    """
-    Returns 1h data for heatmap (best resolution).
-    Falls back to 1d if 1h unavailable.
-    Uses QQQ for NAS100 label.
-    """
-    df = _load_cache(f"df_1h_{label}")
+    """Returns 1h data for heatmap (intraday resolution). Falls back to 1d."""
+    df = _load(f"df_1h_{label}")
     if df is not None and not df.empty:
         return df
-    return _load_cache(f"df_1d_{label}")
+    return _load(f"df_1d_{label}")
+
+def get_vix() -> Optional[float]:
+    """VIX latest close — used by iv_calculator."""
+    df = _load("macro_vix")
+    if df is not None and not df.empty:
+        return float(df['Close'].iloc[-1])
+    return None
+
+
+# ── PUBLIC ACCESSORS — macro data ─────────────────────────────────────────────
+
+def get_macro_df(instrument: str) -> Optional[pd.DataFrame]:
+    """
+    Returns daily DataFrame for a macro instrument.
+    instrument: 'tnx' | 'oil' | 'qqqe' | 'ndx' | 'vix'
+    """
+    return _load(f"macro_{instrument}")
+
+def get_yield_10y() -> Optional[float]:
+    """US 10Y Treasury yield latest close (%)."""
+    df = get_macro_df("tnx")
+    if df is not None and not df.empty:
+        return float(df['Close'].iloc[-1])
+    return None
+
+def get_oil_price() -> Optional[float]:
+    """Brent crude latest close (USD)."""
+    df = get_macro_df("oil")
+    if df is not None and not df.empty:
+        return float(df['Close'].iloc[-1])
+    return None
+
+def get_qqqe_df() -> Optional[pd.DataFrame]:
+    """Equal-weight Nasdaq-100 daily data."""
+    return get_macro_df("qqqe")
+
+def get_qqq_1d() -> Optional[pd.DataFrame]:
+    """QQQ daily data (stored under NAS100 label)."""
+    return _load(f"df_1d_{NAS100_LABEL}")
