@@ -8,6 +8,7 @@ from streamlit_autorefresh import st_autorefresh
 from forex_data_fetcher import fetch_all_pairs, get_1h, get_4h, get_1d, get_pip, PAIRS
 from forex_volume_profile import compute_volume_profile
 from forex_analyst import analyse_pair, FXSignal
+from macro_monitor import get_macro_snapshot
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="FX Major Pairs Monitor", layout="wide", page_icon="💱")
@@ -106,6 +107,36 @@ elif 17 <= utc_h < 21:
     st.warning(f"🟡 New York Session · {utc_str}")
 else:
     st.warning(f"🟡 Market transitioning · {utc_str}")
+
+# ── 10Y YIELD PANEL ─────────────────────────────────────────────────────────
+macro = get_macro_snapshot()
+if macro:
+    yield_col, oil_col, breadth_col, score_col = st.columns(4)
+    with yield_col:
+        st.metric("🏦 US 10Y Yield", f"{macro.yield_10y:.2f}%",
+                  delta=f"{macro.yield_signal}", delta_color="off")
+    with oil_col:
+        st.metric("🛢️ Brent Crude", f"${macro.oil_price:.1f}",
+                  delta=macro.oil_signal, delta_color="off")
+    with breadth_col:
+        st.metric("📊 Breadth", f"QQQ vs QQQE",
+                  delta=macro.breadth_signal.split("—")[0].strip(), delta_color="off")
+    with score_col:
+        st.metric("⚡ Risk Score", f"{macro.risk_score}/100",
+                  delta=macro.risk_icon + " " + macro.risk_level.split(":")[0],
+                  delta_color="off")
+
+    # Yield filter warning for forex
+    if macro.yield_10y > 4.50:
+        st.warning(
+            f"⚠️ **Yield Trap Active** ({macro.yield_10y:.2f}%) — "
+            "Mean Reversion BUY signals on USD pairs may be unreliable. "
+            "Yields at this level support USD strength — favour BREAKOUT BUY on USDJPY/USDCHF."
+        )
+    if "EXHAUSTION" in macro.breadth_signal:
+        st.error("🔴 Market Breadth Exhaustion detected — risk-off environment. Favour CHF/JPY safety flows.")
+
+st.divider()
 
 # ── FETCH DATA ────────────────────────────────────────────────────────────────
 with st.spinner("Fetching forex data..."):
@@ -298,7 +329,14 @@ for idx, pair in enumerate(PAIRS):
                         trade_allowed = False
                         block_reason  = "🔴 Daily loss limit reached"
 
-                    ai: FXSignal = analyse_pair(vp, lot_size, account_size)
+                    # Build yield context for forex Claude prompt
+                    macro_fx = get_macro_snapshot()
+                    yield_ctx = (
+                        f"10Y Yield: {macro_fx.yield_10y:.2f}% ({macro_fx.yield_signal}) | "
+                        f"Risk Score: {macro_fx.risk_score}/100 ({macro_fx.risk_level})"
+                    ) if macro_fx else "unavailable"
+
+                    ai: FXSignal = analyse_pair(vp, lot_size, account_size, yield_context=yield_ctx)
 
                     if ai is None:
                         st.caption("🤖 Claude analysed this signal — conditions not fully met yet. Monitoring.")
