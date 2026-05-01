@@ -72,6 +72,7 @@ def analyse(
     account_balance: float = 100.0,
     lot_size: float = 0.02,
     implied_volatility: str = "unavailable",
+    macro_context: str = "unavailable",
 ) -> Optional[TradeSignal]:
 
     # ── CACHE CHECK ───────────────────────────────────────────────────────────
@@ -91,6 +92,7 @@ Volume Surge Ratio : {vol_ratio:.2f}x
 MACD (1H)          : {"Bullish — MACD above signal" if macd_bullish else "Bearish — MACD below signal"}
 Options Delta      : {delta_val:.2f}
 Implied Volatility : {implied_volatility}
+Macro Risk Context : {macro_context}
 Dashboard Signal   : {raw_signal}
 
 === ACCOUNT & RISK PARAMETERS ===
@@ -102,7 +104,12 @@ Take Profit Rule   : Minimum 2:1 reward-to-risk
 === YOUR TASK ===
 STEP 1 — Confirm technicals are valid for a trade.
 STEP 2 — Use your knowledge of {ticker} recent performance, analyst views, and macro context.
-STEP 3 — Combine both into a final BUY / SELL / HOLD decision.
+STEP 3 — Factor in Macro Risk Context:
+- If YIELD TRAP warning: avoid new BUY entries on tech stocks (yields choking growth)
+- If MARGIN PRESSURE (oil > $110): reduce confidence on AMZN, META, MSFT buys
+- If EXHAUSTION breadth signal: treat BUY signals with skepticism — rally may be narrow
+- If Risk Score >= 70 (DANGER): only take SELL signals or HOLD
+STEP 4 — Combine technicals + IV + macro into final BUY / SELL / HOLD decision.
 Consider IV: HIGH IV Rank = tighter SL. LOW IV Rank = wider TP targets.
 
 IMPORTANT: Plain text only — no <cite> tags, no HTML, no markup.
