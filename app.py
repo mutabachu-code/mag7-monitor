@@ -5,7 +5,8 @@ from scipy.stats import norm
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime, timezone
 
-from data_fetcher import fetch_all_data, get_5m, get_1h, get_1d, get_vix, get_heatmap_data, get_qqq_ndx_ratio, MAG7
+from data_fetcher import fetch_all_data
+from macro_monitor import render_macro_panel, get_macro_snapshot, get_5m, get_1h, get_1d, get_vix, get_heatmap_data, get_qqq_ndx_ratio, MAG7
 from iv_calculator import get_iv_data
 from claude_analyst import analyse
 from risk_manager import RiskConfig, init_risk_state, render_risk_sidebar, check_trade_allowed, record_trade_opened
@@ -316,6 +317,15 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
                         if iv else "unavailable"
                     )
 
+                    # Pass macro risk context to Claude
+                    macro  = get_macro_snapshot()
+                    macro_context = (
+                        f"10Y Yield: {macro.yield_10y:.2f}% ({macro.yield_signal}) | "
+                        f"Oil: ${macro.oil_price:.1f} ({macro.oil_signal}) | "
+                        f"Breadth: {macro.breadth_signal} | "
+                        f"Risk Score: {macro.risk_score}/100 — {macro.risk_level}"
+                    ) if macro else "unavailable"
+
                     ai = analyse(
                         ticker=ind["label"],
                         current_price=ind["curr_p"],
@@ -329,6 +339,7 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
                         account_balance=risk_config.account_size_usd,
                         lot_size=risk_config.lot_size,
                         implied_volatility=iv_str,
+                        macro_context=macro_context,
                     )
 
                     if ai is None:
@@ -398,6 +409,7 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
 # ══════════════════════════════════════════════════════════════════════════════
 
 render_heatmap()
+render_macro_panel()
 
 # NAS100
 st.subheader("📈 Nasdaq 100 Cash CFD (NAS100)")
