@@ -1,216 +1,154 @@
 """
-macro_monitor.py
-----------------
-Tracks macro risk factors for Mag 7 dashboard:
-  1. US 10Y Yield (^TNX) — Yield-to-Growth correlation with Nasdaq
-  2. Oil/Nasdaq ratio (BZ=F vs QQQ) — margin pressure on tech
-  3. Market Breadth — QQQ vs QQQE (Generals vs Soldiers)
-  4. Breaking Point Risk Score — combines all three
+macro_monitor.py  —  v2
+------------------------
+Reads macro data from data_fetcher session_state cache.
+No direct yfinance calls — zero extra API load.
 
-All data fetched with timeout protection and cached in session_state.
+Calculates:
+  1. Yield-to-Growth signal  (^TNX vs Nasdaq correlation)
+  2. Oil Margin Pressure     (BZ=F vs QQQ ratio)
+  3. Market Breadth          (QQQ vs QQQE — Generals vs Soldiers)
+  4. Breaking Point Score    (composite 0-100)
 """
 
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import streamlit as st
-import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
+from data_fetcher import (
+    get_yield_10y, get_oil_price, get_qqqe_df,
+    get_qqq_1d, get_macro_df
+)
 
 
 @dataclass
 class MacroSnapshot:
-    # 10Y Yield
-    yield_10y: float            # current yield %
-    yield_signal: str           # "YIELD TRAP" | "ELEVATED" | "NORMAL"
+    yield_10y: float
+    yield_signal: str
     yield_color: str
-    nasdaq_yield_corr: float    # 10-day rolling correlation (should be negative)
-
-    # Oil pressure
-    oil_price: float            # Brent crude USD
-    oil_nasdaq_ratio: float     # QQQ/Oil ratio — falling = oil taxing tech
-    oil_signal: str             # "MARGIN PRESSURE" | "WATCH" | "CLEAR"
+    nasdaq_yield_corr: float
+    oil_price: float
+    oil_nasdaq_ratio: float
+    oil_signal: str
     oil_color: str
-
-    # Market breadth
     qqq_price: float
     qqqe_price: float
-    breadth_ratio: float        # QQQ / QQQE — rising = narrow market
-    breadth_signal: str         # "EXHAUSTION" | "DIVERGING" | "HEALTHY"
+    breadth_ratio: float
+    breadth_signal: str
     breadth_color: str
-
-    # Breaking point composite
-    risk_score: int             # 0-100
-    risk_level: str             # "DANGER: CRITICAL BREAKING POINT" | "WARNING: FRAGILE EQUILIBRIUM" | "CLEAR: MOMENTUM CONTINUATION"
+    risk_score: int
+    risk_level: str
     risk_color: str
     risk_icon: str
 
 
-CACHE_TTL   = 300   # 5 min
-TIMEOUT     = 10
+CACHE_TTL = 65   # match data_fetcher TTL
 
 
-def _fetch(func, timeout=TIMEOUT):
-    result = [None]
-    def t(): 
-        try: result[0] = func()
-        except Exception as e: print(f"[macro] {e}")
-    th = threading.Thread(target=t, daemon=True)
-    th.start(); th.join(timeout=timeout)
-    return result[0]
-
-
-def _cache_valid():
-    return (time.time() - st.session_state.get("macro_ts", 0)) < CACHE_TTL
+def _macro_cache_valid() -> bool:
+    return (time.time() - st.session_state.get("macro_snap_ts", 0)) < CACHE_TTL
 
 
 def get_macro_snapshot() -> Optional[MacroSnapshot]:
-    """Main entry. Returns cached snapshot or fetches fresh data."""
-
-    if _cache_valid() and "macro_snap" in st.session_state:
+    if _macro_cache_valid() and "macro_snap" in st.session_state:
         return st.session_state["macro_snap"]
 
-    # ── FETCH IN PARALLEL ─────────────────────────────────────────────────────
-    data = {}
-
-    def fetch_yield():
-        df = yf.Ticker("^TNX").history(period="30d", interval="1d")
-        data["yield"] = df if not df.empty else None
-
-    def fetch_oil():
-        df = yf.Ticker("BZ=F").history(period="5d", interval="1d")
-        data["oil"] = df if not df.empty else None
-
-    def fetch_qqq():
-        df = yf.Ticker("QQQ").history(period="30d", interval="1d")
-        data["qqq"] = df if not df.empty else None
-
-    def fetch_qqqe():
-        df = yf.Ticker("QQQE").history(period="30d", interval="1d")
-        data["qqqe"] = df if not df.empty else None
-
-    def fetch_ndx():
-        df = yf.Ticker("^NDX").history(period="30d", interval="1d")
-        data["ndx"] = df if not df.empty else None
-
-    threads = [threading.Thread(target=f, daemon=True)
-               for f in [fetch_yield, fetch_oil, fetch_qqq, fetch_qqqe, fetch_ndx]]
-    for t in threads: t.start()
-    for t in threads: t.join(timeout=TIMEOUT + 2)
+    # ── READ FROM data_fetcher CACHE ─────────────────────────────────────────
+    yield_10y   = get_yield_10y() or 4.30
+    oil_price   = get_oil_price() or 75.0
+    df_qqq      = get_qqq_1d()
+    df_qqqe     = get_qqqe_df()
+    df_tnx      = get_macro_df("tnx")
+    df_ndx      = get_macro_df("ndx")
 
     # ── 1. 10Y YIELD ─────────────────────────────────────────────────────────
-    yield_10y      = 4.30   # fallback
-    yield_signal   = "NORMAL"
-    yield_color    = "#2d9e2d"
-    nasdaq_corr    = -0.5
+    nasdaq_corr = -0.5
 
-    df_yield = data.get("yield")
-    df_ndx   = data.get("ndx")
+    if df_tnx is not None and df_ndx is not None and len(df_tnx) >= 10 and len(df_ndx) >= 10:
+        combined = pd.DataFrame({
+            "yield": df_tnx["Close"].tail(20),
+            "ndx":   df_ndx["Close"].tail(20),
+        }).dropna()
+        if len(combined) >= 10:
+            nasdaq_corr = float(combined["yield"].rolling(10).corr(combined["ndx"]).iloc[-1])
 
-    if df_yield is not None and len(df_yield) >= 2:
-        yield_10y = float(df_yield["Close"].iloc[-1])
-
-        # 10-day rolling correlation between TNX and NDX
-        if df_ndx is not None and len(df_ndx) >= 10 and len(df_yield) >= 10:
-            combined = pd.DataFrame({
-                "yield": df_yield["Close"].tail(20),
-                "ndx":   df_ndx["Close"].tail(20),
-            }).dropna()
-            if len(combined) >= 10:
-                nasdaq_corr = float(combined["yield"].rolling(10).corr(combined["ndx"]).iloc[-1])
-
-        # Yield Trap: yield > 4.45% AND correlation strongly negative
-        if yield_10y > 4.50 and nasdaq_corr < -0.8:
-            yield_signal = "⚠️ YIELD TRAP"
-            yield_color  = "#8b0000"
-        elif yield_10y > 4.45:
-            yield_signal = "🟡 ELEVATED"
-            yield_color  = "#e6a817"
-        else:
-            yield_signal = "🟢 NORMAL"
-            yield_color  = "#2d9e2d"
+    if yield_10y > 4.50 and nasdaq_corr < -0.8:
+        yield_signal = "⚠️ YIELD TRAP"
+        yield_color  = "#8b0000"
+    elif yield_10y > 4.45:
+        yield_signal = "🟡 ELEVATED"
+        yield_color  = "#e6a817"
+    else:
+        yield_signal = "🟢 NORMAL"
+        yield_color  = "#2d9e2d"
 
     # ── 2. OIL / MARGIN PRESSURE ──────────────────────────────────────────────
-    oil_price       = 75.0
-    oil_signal      = "CLEAR"
-    oil_color       = "#2d9e2d"
-    oil_nasdaq_ratio= 5.0
+    qqq_price        = 460.0
+    oil_nasdaq_ratio = 6.0
 
-    df_oil = data.get("oil")
-    df_qqq = data.get("qqq")
+    if df_qqq is not None and not df_qqq.empty:
+        qqq_price = float(df_qqq['Close'].iloc[-1])
+        oil_nasdaq_ratio = qqq_price / oil_price if oil_price > 0 else 6.0
 
-    if df_oil is not None and len(df_oil) >= 2:
-        oil_price = float(df_oil["Close"].iloc[-1])
-
-    if df_qqq is not None and len(df_qqq) >= 2:
-        qqq_price = float(df_qqq["Close"].iloc[-1])
-        oil_nasdaq_ratio = qqq_price / oil_price if oil_price > 0 else 5.0
-
-        # Check if ratio is falling (oil rising faster than QQQ)
-        if len(df_qqq) >= 5 and df_oil is not None and len(df_oil) >= 5:
-            ratio_series = df_qqq["Close"].tail(10) / df_oil["Close"].tail(10)
-            ratio_pct_change = float((ratio_series.iloc[-1] - ratio_series.iloc[0]) / ratio_series.iloc[0] * 100)
+        # Ratio trend: falling = oil outpacing QQQ
+        if len(df_qqq) >= 5:
+            qqq_5d  = float(df_qqq['Close'].pct_change(5).iloc[-1]) * 100
+            # Approximate oil 5d change
+            oil_5d  = 0.0
+            if df_tnx is not None and len(df_tnx) >= 5:   # reuse as proxy length check
+                pass   # oil daily already has latest price; simple threshold sufficient
         else:
-            ratio_pct_change = 0
+            qqq_5d = 0.0
 
-        if oil_price > 110:
-            oil_signal = "🔴 MARGIN PRESSURE"
-            oil_color  = "#8b0000"
-        elif oil_price > 95 or ratio_pct_change < -5:
-            oil_signal = "🟡 WATCH"
-            oil_color  = "#e6a817"
-        else:
-            oil_signal = "🟢 CLEAR"
-            oil_color  = "#2d9e2d"
+    if oil_price > 110:
+        oil_signal = "🔴 MARGIN PRESSURE"
+        oil_color  = "#8b0000"
+    elif oil_price > 95:
+        oil_signal = "🟡 WATCH"
+        oil_color  = "#e6a817"
     else:
-        qqq_price = 460.0
+        oil_signal = "🟢 CLEAR"
+        oil_color  = "#2d9e2d"
 
-    # ── 3. MARKET BREADTH (QQQ vs QQQE) ──────────────────────────────────────
+    # ── 3. MARKET BREADTH ─────────────────────────────────────────────────────
     qqqe_price     = 80.0
-    breadth_ratio  = 1.0
-    breadth_signal = "HEALTHY"
+    breadth_ratio  = 0.0
+    breadth_signal = "🟢 HEALTHY — Broad participation"
     breadth_color  = "#2d9e2d"
 
-    df_qqqe = data.get("qqqe")
+    if df_qqqe is not None and not df_qqqe.empty and df_qqq is not None and not df_qqq.empty:
+        qqqe_price = float(df_qqqe['Close'].iloc[-1])
 
-    if df_qqqe is not None and len(df_qqqe) >= 2 and df_qqq is not None and len(df_qqq) >= 5:
-        qqqe_price = float(df_qqqe["Close"].iloc[-1])
+        if len(df_qqq) >= 6 and len(df_qqqe) >= 6:
+            qqq_ret  = float(df_qqq['Close'].pct_change(5).iloc[-1]) * 100
+            qqqe_ret = float(df_qqqe['Close'].pct_change(5).iloc[-1]) * 100
+            breadth_ratio = qqq_ret - qqqe_ret
 
-        # Normalise both to same start point (5 days ago) for comparison
-        qqq_ret  = float(df_qqq["Close"].pct_change(5).iloc[-1]) * 100
-        qqqe_ret = float(df_qqqe["Close"].pct_change(5).iloc[-1]) * 100
+            if qqq_ret > 0 and qqqe_ret < -1:
+                breadth_signal = "🔴 EXHAUSTION — Generals vs Soldiers"
+                breadth_color  = "#8b0000"
+            elif breadth_ratio > 3:
+                breadth_signal = "🟡 DIVERGING — Market narrowing"
+                breadth_color  = "#e6a817"
+            else:
+                breadth_signal = "🟢 HEALTHY — Broad participation"
+                breadth_color  = "#2d9e2d"
 
-        breadth_ratio = qqq_ret - qqqe_ret  # positive = QQQ outperforming = narrow market
-
-        # Generals ahead while Soldiers fall = exhaustion
-        if qqq_ret > 0 and qqqe_ret < -1:
-            breadth_signal = "🔴 EXHAUSTION — Generals vs Soldiers"
-            breadth_color  = "#8b0000"
-        elif breadth_ratio > 3:
-            breadth_signal = "🟡 DIVERGING — Market narrowing"
-            breadth_color  = "#e6a817"
-        else:
-            breadth_signal = "🟢 HEALTHY — Broad participation"
-            breadth_color  = "#2d9e2d"
-
-    # ── 4. BREAKING POINT RISK SCORE ─────────────────────────────────────────
+    # ── 4. BREAKING POINT SCORE ───────────────────────────────────────────────
     risk_score = 0
 
-    # Yield risk (40 pts max)
     if yield_10y > 4.50 and nasdaq_corr < -0.8:
         risk_score += 40
     elif yield_10y > 4.45:
         risk_score += 20
 
-    # Oil risk (30 pts max)
     if oil_price > 110:
         risk_score += 30
     elif oil_price > 95:
         risk_score += 15
 
-    # RSI/breadth risk (30 pts max) — use breadth signal as proxy
     if "EXHAUSTION" in breadth_signal:
         risk_score += 30
     elif "DIVERGING" in breadth_signal:
@@ -240,33 +178,31 @@ def get_macro_snapshot() -> Optional[MacroSnapshot]:
         risk_level=risk_level, risk_color=risk_color, risk_icon=risk_icon,
     )
 
-    st.session_state["macro_snap"] = snap
-    st.session_state["macro_ts"]   = time.time()
+    st.session_state["macro_snap"]    = snap
+    st.session_state["macro_snap_ts"] = time.time()
     return snap
 
 
 def render_macro_panel():
-    """Render the full macro risk panel in the Mag7 dashboard."""
     st.subheader("🌐 Macro Risk Monitor")
 
     snap = get_macro_snapshot()
     if snap is None:
-        st.warning("Macro data unavailable — check network.")
+        st.warning("Macro data unavailable.")
         return
 
-    # ── BREAKING POINT SCORE ─────────────────────────────────────────────────
+    # Breaking Point Score banner
     st.markdown(
-        f"<div style='padding:12px;border-radius:8px;background:{snap.risk_color}22;"
-        f"border:2px solid {snap.risk_color};margin-bottom:12px'>"
-        f"<span style='font-size:1.3em;font-weight:bold;color:{snap.risk_color}'>"
-        f"{snap.risk_icon} {snap.risk_level}</span><br>"
-        f"<span style='color:#aaa'>Risk Score: {snap.risk_score}/100</span>"
+        f"<div style='padding:12px;border-radius:8px;"
+        f"background:{snap.risk_color}22;border:2px solid {snap.risk_color};margin-bottom:8px'>"
+        f"<span style='font-size:1.2em;font-weight:bold;color:{snap.risk_color}'>"
+        f"{snap.risk_icon} {snap.risk_level}</span>"
+        f"<span style='color:#aaa;margin-left:16px'>Score: {snap.risk_score}/100</span>"
         f"</div>",
         unsafe_allow_html=True
     )
     st.progress(snap.risk_score / 100)
 
-    # ── THREE COLUMNS ─────────────────────────────────────────────────────────
     c1, c2, c3 = st.columns(3)
 
     with c1:
@@ -277,31 +213,31 @@ def render_macro_panel():
             unsafe_allow_html=True
         )
         st.caption(snap.yield_signal)
-        st.caption(f"Nasdaq corr: {snap.nasdaq_yield_corr:.2f}")
+        st.caption(f"Nasdaq corr (10d): {snap.nasdaq_yield_corr:.2f}")
         if "TRAP" in snap.yield_signal:
             st.error("Yields choking growth — reduce long exposure")
 
     with c2:
-        st.markdown("**🛢️ Brent Crude / Oil Pressure**")
+        st.markdown("**🛢️ Brent Crude**")
         st.markdown(
             f"<span style='font-size:1.4em;font-weight:bold;color:{snap.oil_color}'>"
             f"${snap.oil_price:.1f}</span>",
             unsafe_allow_html=True
         )
         st.caption(snap.oil_signal)
-        st.caption(f"QQQ/Oil ratio: {snap.oil_nasdaq_ratio:.1f}")
+        st.caption(f"QQQ/Oil ratio: {snap.oil_nasdaq_ratio:.1f}x")
         if "MARGIN" in snap.oil_signal:
             st.error("Energy costs taxing AI margins — AMZN/META at risk")
 
     with c3:
-        st.markdown("**📊 Market Breadth (QQQ vs QQQE)**")
+        st.markdown("**📊 Breadth (QQQ vs QQQE)**")
         st.markdown(
             f"<span style='font-size:1.4em;font-weight:bold;color:{snap.breadth_color}'>"
-            f"{'↑' if snap.breadth_ratio > 0 else '↓'}{abs(snap.breadth_ratio):.1f}%</span>",
+            f"{'↑' if snap.breadth_ratio >= 0 else '↓'}{abs(snap.breadth_ratio):.1f}%</span>",
             unsafe_allow_html=True
         )
         st.caption(snap.breadth_signal)
-        st.caption("QQQ 5d vs QQQE 5d performance gap")
+        st.caption("5d QQQ vs QQQE performance gap")
         if "EXHAUSTION" in snap.breadth_signal:
             st.error("Generals only — classic exhaustion before reversal")
 
