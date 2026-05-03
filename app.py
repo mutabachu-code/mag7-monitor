@@ -5,8 +5,9 @@ from scipy.stats import norm
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime, timezone
 
-from data_fetcher import fetch_all_data
-from macro_monitor import render_macro_panel, get_macro_snapshot, get_5m, get_1h, get_1d, get_vix, get_heatmap_data, get_qqq_ndx_ratio, MAG7
+from data_fetcher import fetch_all_data, get_5m, get_1h, get_1d, get_vix, get_heatmap_data, get_qqq_ndx_ratio, get_gold_df, get_macro_df, MAG7
+from macro_monitor import render_macro_panel, get_macro_snapshot
+from regime_detector import detect_regime_stocks, render_regime_panel, render_regime_badge
 from iv_calculator import get_iv_data
 from claude_analyst import analyse
 from risk_manager import RiskConfig, init_risk_state, render_risk_sidebar, check_trade_allowed, record_trade_opened
@@ -87,6 +88,18 @@ elif fetch_elapsed > 15:
     st.caption(f"⏱️ Data loaded in {fetch_elapsed:.0f}s")
 
 vix_value = get_vix()
+
+# ── COMPUTE GLOBAL REGIME (shared across all ticker cards) ───────────────────
+_macro_snap  = get_macro_snapshot()
+_gold_df     = get_gold_df()
+_tnx_df      = get_macro_df("tnx")
+_global_regime = detect_regime_stocks(
+    vix=vix_value,
+    macro_risk_score=_macro_snap.risk_score if _macro_snap else None,
+    breadth_ratio=_macro_snap.breadth_ratio if _macro_snap else None,
+    gold_df=_gold_df,
+    tnx_df=_tnx_df,
+)
 
 
 # ── HEATMAP ───────────────────────────────────────────────────────────────────
@@ -308,6 +321,8 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
 
                 if not session_ok:
                     st.caption(session_msg)
+                elif _global_regime.state == 2:
+                    st.error(f"🔴 {_global_regime.icon} CRISIS regime — no new entries. {_global_regime.strategy_note}")
                 else:
                     trade_allowed, trade_reason = check_trade_allowed(risk_config, ind["label"])
 
@@ -337,7 +352,7 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
                         delta_val=ind["delta_val"],
                         sma200=ind["sma200_1h"],
                         account_balance=risk_config.account_size_usd,
-                        lot_size=risk_config.lot_size,
+                        lot_size=effective_lot,
                         implied_volatility=iv_str,
                         macro_context=macro_context,
                     )
@@ -410,6 +425,9 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
 
 render_heatmap()
 render_macro_panel()
+
+# Regime panel
+render_regime_panel(_global_regime, "Market Regime Detector")
 
 # NAS100
 st.subheader("📈 Nasdaq 100 Cash CFD (NAS100)")
