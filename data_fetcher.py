@@ -35,7 +35,8 @@ QQQE_YF      = 'QQQE'       # Equal-weight Nasdaq-100 (breadth indicator)
 ALL_LABELS   = [NAS100_LABEL] + MAG7   # price card tickers
 
 # Macro instruments fetched separately (daily data only)
-MACRO_YF     = [TNX_YF, OIL_YF, QQQE_YF, NDX_YF, VIX_YF]
+GOLD_YF      = 'GLD'       # Gold ETF — reliable proxy for XAU/USD
+MACRO_YF     = [TNX_YF, OIL_YF, QQQE_YF, NDX_YF, VIX_YF, GOLD_YF]
 
 CACHE_TTL    = 65    # seconds — slightly longer than 60s refresh
 FETCH_TIMEOUT = 10   # seconds per ticker before abandoning
@@ -163,6 +164,7 @@ def fetch_all_data() -> bool:
             QQQE_YF: "macro_qqqe",
             NDX_YF:  "macro_ndx",
             VIX_YF:  "macro_vix",
+            GOLD_YF: "macro_gold",
         }.get(sym, f"macro_{sym}")
         _store(key, df)
 
@@ -242,6 +244,10 @@ def get_oil_price() -> Optional[float]:
 def get_qqqe_df() -> Optional[pd.DataFrame]:
     """Equal-weight Nasdaq-100 daily data."""
     return get_macro_df("qqqe")
+
+def get_gold_df() -> Optional[pd.DataFrame]:
+    """Gold ETF (GLD) daily data — for cross-asset risk-off detection."""
+    return _load("macro_gold")
 
 def get_qqq_1d() -> Optional[pd.DataFrame]:
     """QQQ daily data (stored under NAS100 label)."""
