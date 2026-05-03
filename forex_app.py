@@ -5,12 +5,11 @@ import time
 from datetime import datetime, timezone
 from streamlit_autorefresh import st_autorefresh
 
-from forex_data_fetcher import fetch_all_pairs, get_1h, get_4h, get_1d, get_pip, PAIRS
+from forex_data_fetcher import fetch_all_pairs, get_1h, get_4h, get_1d, get_pip, PAIRS, get_fx_gold_df, get_fx_macro
 from forex_volume_profile import compute_volume_profile
 from forex_analyst import analyse_pair, FXSignal
 from macro_monitor import get_macro_snapshot
 from regime_detector import detect_regime_forex, render_regime_panel, render_regime_badge
-from forex_data_fetcher import get_fx_gold_df, get_fx_macro
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="FX Major Pairs Monitor", layout="wide", page_icon="💱")
