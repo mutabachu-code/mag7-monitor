@@ -9,6 +9,8 @@ from forex_data_fetcher import fetch_all_pairs, get_1h, get_4h, get_1d, get_pip,
 from forex_volume_profile import compute_volume_profile
 from forex_analyst import analyse_pair, FXSignal
 from macro_monitor import get_macro_snapshot
+from regime_detector import detect_regime_forex, render_regime_panel, render_regime_badge
+from forex_data_fetcher import get_fx_gold_df, get_fx_macro
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="FX Major Pairs Monitor", layout="wide", page_icon="💱")
@@ -146,7 +148,27 @@ if not data_ok:
     st.error("⚠️ Forex data unavailable. Retrying on next refresh.")
     st.stop()
 
+# ── GLOBAL FOREX REGIME ───────────────────────────────────────────────────────
+_fx_macro  = get_macro_snapshot()
+_fx_gold   = get_fx_gold_df()
+_fx_tnx    = get_fx_macro("tnx")
+_fx_jpy    = get_fx_macro("usdjpy") if hasattr(get_fx_macro, "__call__") else None
+
+# Use USDJPY 1h as JPY proxy for cross-asset check
+from forex_data_fetcher import get_1h as fx_get_1h
+_fx_jpy_df = fx_get_1h("USDJPY")
+
+_global_fx_regime = detect_regime_forex(
+    vix=_fx_macro.yield_10y if _fx_macro else None,
+    macro_risk_score=_fx_macro.risk_score if _fx_macro else None,
+    gold_df=_fx_gold,
+    jpy_df=_fx_jpy_df,
+    tnx_df=_fx_tnx,
+)
+
 # ── CORRELATION MATRIX ────────────────────────────────────────────────────────
+render_regime_panel(_global_fx_regime, "Forex Market Regime")
+
 def render_correlation_matrix():
     st.subheader("🔗 Correlation Matrix — Lead/Lag Analysis")
     st.caption("Values near +1.0 = highly correlated · Near -1.0 = inverse · Find the 'Leader' pair")
@@ -283,6 +305,15 @@ for idx, pair in enumerate(PAIRS):
         for k, v in sig_color_map.items():
             if k in vp.signal: sc = v; break
         st.markdown(f"**Signal:** :{sc}[{vp.signal_icon} {vp.signal}]")
+        # Per-pair regime
+        _pair_regime = detect_regime_forex(
+            vix=None, atr_pct=vp.atr_pct, pair=pair,
+            trend_bullish=vp.trend_bullish, rsi=vp.rsi_1h,
+            vol_intensity=vp.volume_intensity,
+            macro_risk_score=_fx_macro.risk_score if _fx_macro else None,
+            gold_df=_fx_gold, jpy_df=_fx_jpy_df, tnx_df=_fx_tnx,
+        )
+        render_regime_badge(_pair_regime)
 
         with st.expander("📊 Volume Profile Details"):
             c1, c2, c3 = st.columns(3)
@@ -312,6 +343,8 @@ for idx, pair in enumerate(PAIRS):
 
                 if not session_ok:
                     st.caption(session_msg)
+                elif _global_fx_regime.state == 2 and not _global_fx_regime.allowed_signals:
+                    st.error(f"🔴 CRISIS regime — {_global_fx_regime.strategy_note}")
                 else:
                     # Risk checks
                     trade_allowed = True
@@ -336,7 +369,12 @@ for idx, pair in enumerate(PAIRS):
                         f"Risk Score: {macro_fx.risk_score}/100 ({macro_fx.risk_level})"
                     ) if macro_fx else "unavailable"
 
-                    ai: FXSignal = analyse_pair(vp, lot_size, account_size, yield_context=yield_ctx)
+                    effective_fx_lot = round(lot_size * _pair_regime.lot_multiplier, 2)
+                    if effective_fx_lot <= 0:
+                        st.error(f"🔴 {_pair_regime.icon} Regime blocks trading: {_pair_regime.strategy_note}")
+                        ai = None
+                    else:
+                        ai: FXSignal = analyse_pair(vp, effective_fx_lot, account_size, yield_context=yield_ctx)
 
                     if ai is None:
                         st.caption("🤖 Claude analysed this signal — conditions not fully met yet. Monitoring.")
