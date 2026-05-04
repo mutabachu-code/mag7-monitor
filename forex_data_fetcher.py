@@ -43,12 +43,18 @@ PIP_MAP = {
 
 # ── MACRO INSTRUMENTS (daily) ─────────────────────────────────────────────────
 MACRO_INSTRUMENTS = {
-    'tnx':  '^TNX',    # US 10Y yield
-    'oil':  'BZ=F',    # Brent crude
+    'tnx':  '^TNX',    # US 10Y yield (fallback: IEF ETF)
+    'oil':  'BZ=F',    # Brent crude (fallback: USO ETF)
     'qqq':  'QQQ',     # Nasdaq proxy
-    'vix':  '^VIX',    # Volatility / risk-off gauge
+    'vix':  '^VIX',    # Volatility
     'dxy':  'UUP',     # USD Index proxy
-    'gold': 'GLD',     # Gold ETF — cross-asset risk-off signal
+    'gold': 'GLD',     # Gold ETF
+}
+
+# Fallback symbols for unreliable futures/index tickers
+MACRO_FALLBACKS = {
+    '^TNX': 'IEF',    # 7-10Y Treasury ETF
+    'BZ=F': 'USO',    # Oil ETF
 }
 
 CACHE_TTL     = 65
@@ -122,7 +128,18 @@ def _fetch_macro(key: str, symbol: str) -> Optional[pd.DataFrame]:
     def get():
         period = "30d" if key in ('tnx', 'qqq', 'dxy') else "5d"
         df = yf.Ticker(symbol).history(period=period, interval="1d").ffill().bfill()
-        return df if not df.empty else None
+        if not df.empty:
+            last_date = pd.Timestamp(df.index[-1]).date()
+            days_old  = (pd.Timestamp.now().date() - last_date).days
+            if days_old <= 4:
+                return df
+            print(f"[forex_fetcher] {symbol} stale ({days_old}d) — trying fallback")
+        fallback = MACRO_FALLBACKS.get(symbol)
+        if fallback:
+            df2 = yf.Ticker(fallback).history(period="5d", interval="1d").ffill().bfill()
+            if not df2.empty:
+                return df2
+        return None
     return _fetch_with_timeout(get, FETCH_TIMEOUT)
 
 
