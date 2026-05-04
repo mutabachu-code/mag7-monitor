@@ -29,7 +29,9 @@ NAS100_YF    = 'QQQ'        # reliable proxy; ^NDX often blocked on Linux
 VIX_YF       = '^VIX'
 NDX_YF       = '^NDX'       # only used for QQQ→NAS100 scaling ratio
 TNX_YF       = '^TNX'       # US 10Y Treasury yield
-OIL_YF       = 'BZ=F'       # Brent crude
+TNX_FALLBACK = 'IEF'        # 7-10Y Treasury ETF as fallback
+OIL_YF       = 'BZ=F'       # Brent crude futures
+OIL_FALLBACK = 'USO'        # Oil ETF as fallback (more reliable)
 QQQE_YF      = 'QQQE'       # Equal-weight Nasdaq-100 (breadth indicator)
 
 ALL_LABELS   = [NAS100_LABEL] + MAG7   # price card tickers
@@ -98,11 +100,33 @@ def _fetch_price_ticker(label: str) -> Tuple[Optional[pd.DataFrame],
 # ── MACRO INSTRUMENT FETCH (daily only) ───────────────────────────────────────
 
 def _fetch_macro_instrument(symbol: str) -> Optional[pd.DataFrame]:
-    """Fetch daily data for a macro instrument (TNX, BZ=F, QQQE, NDX, VIX)."""
+    """
+    Fetch daily data for a macro instrument with fallback.
+    BZ=F (Brent) often returns stale contract data — falls back to USO.
+    ^TNX sometimes returns empty — falls back to IEF yield proxy.
+    """
+    fallbacks = {OIL_YF: OIL_FALLBACK, TNX_YF: TNX_FALLBACK}
+
     def get():
         period = "30d" if symbol in [TNX_YF, QQQE_YF, NDX_YF] else "5d"
         df = yf.Ticker(symbol).history(period=period, interval="1d").ffill().bfill()
-        return df if not df.empty else None
+        if not df.empty:
+            # Validate data is recent (within 3 trading days)
+            last_date = pd.Timestamp(df.index[-1]).date()
+            today     = pd.Timestamp.now().date()
+            days_old  = (today - last_date).days
+            if days_old <= 4:   # allow for weekends
+                return df
+            print(f"[data_fetcher] {symbol} data is {days_old} days old — trying fallback")
+
+        # Try fallback symbol if available
+        fallback = fallbacks.get(symbol)
+        if fallback:
+            print(f"[data_fetcher] Falling back {symbol} → {fallback}")
+            df2 = yf.Ticker(fallback).history(period="5d", interval="1d").ffill().bfill()
+            if not df2.empty:
+                return df2
+        return None
     return _fetch_with_timeout(get, FETCH_TIMEOUT)
 
 
@@ -228,10 +252,19 @@ def get_macro_df(instrument: str) -> Optional[pd.DataFrame]:
     return _load(f"macro_{instrument}")
 
 def get_yield_10y() -> Optional[float]:
-    """US 10Y Treasury yield latest close (%)."""
+    """
+    US 10Y Treasury yield latest close (%).
+    ^TNX returns yield directly (e.g. 4.38).
+    IEF fallback returns price (~$95) — we skip yield calculation in that case.
+    """
     df = get_macro_df("tnx")
     if df is not None and not df.empty:
-        return float(df['Close'].iloc[-1])
+        val = float(df['Close'].iloc[-1])
+        # ^TNX yield is 3-6%, IEF price is 80-110 — easy to distinguish
+        if val < 15:
+            return val   # genuine yield %
+        # IEF price — approximate yield (IEF ~$95 ≈ 4% yield, inverse relationship)
+        return round(max(0, 10 - (val / 11)), 2)
     return None
 
 def get_oil_price() -> Optional[float]:
