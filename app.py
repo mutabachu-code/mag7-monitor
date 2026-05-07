@@ -450,8 +450,10 @@ _nas_5m = get_5m(NAS100_LABEL)
 _nas_1d = get_1d(NAS100_LABEL)
 
 if _nas_5m is not None and nas_ind:
-    _nas_price = nas_ind['curr_p']
-    _nas_scalp = analyse_nas100_scalp(_nas_5m, _nas_1d, _nas_price)
+    _nas_price = nas_ind['curr_p']          # already scaled to NAS100 index pts
+    _nas_ratio = get_qqq_ndx_ratio()        # QQQ→NAS100 multiplier (~40x)
+    _nas_scalp = analyse_nas100_scalp(_nas_5m, _nas_1d, _nas_price,
+                                      qqq_to_nas100_ratio=_nas_ratio)
 
     sc1, sc2, sc3, sc4 = st.columns(4)
 
