@@ -10,6 +10,7 @@ from forex_volume_profile import compute_volume_profile
 from forex_analyst import analyse_pair, FXSignal
 from macro_monitor import get_macro_snapshot
 from regime_detector import detect_regime_forex, render_regime_panel, render_regime_badge
+from scalping_engine import analyse_forex_scalp, ScalpSetup
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="FX Major Pairs Monitor", layout="wide", page_icon="💱")
@@ -313,6 +314,43 @@ for idx, pair in enumerate(PAIRS):
             gold_df=_fx_gold, jpy_df=_fx_jpy_df, tnx_df=_fx_tnx,
         )
         render_regime_badge(_pair_regime)
+
+        # ── SCALPING SETUPS ───────────────────────────────────────────────────
+        _scalp = analyse_forex_scalp(pair, get_1h(pair), vp.current_price)
+        if _scalp.best_setup or _scalp.asian_range:
+            with st.expander("🎯 Scalping Setups", expanded=False):
+                # Asian Range
+                ar = _scalp.asian_range
+                if ar:
+                    st.markdown(f"**Asian Range:** {ar['low']:.5f} — {ar['high']:.5f} "
+                               f"({ar['range_pips']:.0f} pips)")
+                    st.caption(ar['status'])
+
+                # Best setup
+                bs = _scalp.best_setup
+                if bs:
+                    icons = {"ORDER_BLOCK":"🟦","FVG":"⬜","LIQ_SWEEP":"💧"}
+                    icon  = icons.get(bs.setup_type, "🎯")
+                    d_col = "green" if bs.direction == "BUY" else "red"
+                    st.markdown(
+                        f"**{icon} {bs.setup_type.replace('_',' ')}** — "
+                        f":{d_col}[{bs.direction}] | {bs.strength}"
+                    )
+                    st.caption(bs.description)
+                    lc, rc = st.columns(2)
+                    lc.metric("Zone", f"{bs.entry_zone_low:.5f}–{bs.entry_zone_high:.5f}")
+                    rc.metric("Target", f"{bs.target:.5f}",
+                             delta=f"{bs.pips_to_target:.0f} pips")
+                    rr = bs.pips_to_target / bs.risk_pips if bs.risk_pips > 0 else 0
+                    st.caption(f"R:R = {rr:.1f}:1 | Risk: {bs.risk_pips:.0f} pips | "
+                              f"Invalidation: {bs.invalidation:.5f}")
+
+                # All setups summary
+                total = len(_scalp.order_blocks) + len(_scalp.fvgs) + len(_scalp.liq_sweeps)
+                if total > 1:
+                    st.caption(f"📋 {len(_scalp.order_blocks)} OB · "
+                              f"{len(_scalp.fvgs)} FVG · "
+                              f"{len(_scalp.liq_sweeps)} Sweep detected")
 
         with st.expander("📊 Volume Profile Details"):
             c1, c2, c3 = st.columns(3)
