@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timezone
 from streamlit_autorefresh import st_autorefresh
 
-from forex_data_fetcher import fetch_all_pairs, get_1h, get_4h, get_1d, get_pip, PAIRS, get_fx_gold_df, get_fx_macro
+from forex_data_fetcher import fetch_all_pairs, get_15m, get_1h, get_4h, get_1d, get_pip, PAIRS, get_fx_gold_df, get_fx_macro
 from forex_volume_profile import compute_volume_profile
 from forex_analyst import analyse_pair, FXSignal
 from macro_monitor import get_macro_snapshot
@@ -315,42 +315,103 @@ for idx, pair in enumerate(PAIRS):
         )
         render_regime_badge(_pair_regime)
 
-        # ── SCALPING SETUPS ───────────────────────────────────────────────────
-        _scalp = analyse_forex_scalp(pair, get_1h(pair), vp.current_price)
-        if _scalp.best_setup or _scalp.asian_range:
-            with st.expander("🎯 Scalping Setups", expanded=False):
-                # Asian Range
-                ar = _scalp.asian_range
-                if ar:
-                    st.markdown(f"**Asian Range:** {ar['low']:.5f} — {ar['high']:.5f} "
-                               f"({ar['range_pips']:.0f} pips)")
-                    st.caption(ar['status'])
+        # ── SCALPING SETUPS — always visible, uses 15m for precision ──────────
+        _df_15m = get_15m(pair)
+        _df_1h  = get_1h(pair)
+        # Use 15m if available, fall back to 1h
+        _scalp_df = _df_15m if _df_15m is not None and len(_df_15m) >= 20 else _df_1h
+        _scalp = analyse_forex_scalp(pair, _scalp_df, vp.current_price)
 
-                # Best setup
-                bs = _scalp.best_setup
-                if bs:
-                    icons = {"ORDER_BLOCK":"🟦","FVG":"⬜","LIQ_SWEEP":"💧"}
-                    icon  = icons.get(bs.setup_type, "🎯")
-                    d_col = "green" if bs.direction == "BUY" else "red"
+        with st.expander("🎯 Scalping Setups", expanded=False):
+            icons = {"ORDER_BLOCK":"🟦 OB","FVG":"⬜ FVG","LIQ_SWEEP":"💧 SWEEP"}
+            tf_label = "15m" if (_df_15m is not None and len(_df_15m) >= 20) else "1H"
+            st.caption(f"Scanning {tf_label} chart · Session: {_scalp.session}")
+
+            # ── Asian Range ───────────────────────────────────────────────────
+            ar = _scalp.asian_range
+            if ar:
+                ar_col1, ar_col2 = st.columns(2)
+                ar_col1.metric("Asian High", f"{ar['high']:.5f}")
+                ar_col2.metric("Asian Low",  f"{ar['low']:.5f}")
+                range_color = "green" if ar['breakout_up'] else "red" if ar['breakout_down'] else "gray"
+                st.markdown(f"**Range:** :{range_color}[{ar['status']}] · {ar['range_pips']:.0f} pips")
+            else:
+                st.caption("Asian range: calculating...")
+
+            st.markdown("---")
+
+            # ── Count all setups ──────────────────────────────────────────────
+            total_ob    = len(_scalp.order_blocks)
+            total_fvg   = len(_scalp.fvgs)
+            total_sweep = len(_scalp.liq_sweeps)
+            total_all   = total_ob + total_fvg + total_sweep
+
+            if total_all == 0:
+                st.caption("📭 No active scalping setups detected. "
+                           "Price not near any OB, FVG, or sweep level.")
+            else:
+                st.caption(f"📋 Found: {total_ob} Order Block · "
+                           f"{total_fvg} FVG · {total_sweep} Liquidity Sweep")
+
+            # ── Best Setup ───────────────────────────────────────────────────
+            bs = _scalp.best_setup
+            if bs:
+                d_col  = "#2d9e2d" if bs.direction == "BUY" else "#c9302c"
+                s_icon = icons.get(bs.setup_type, "🎯")
+                rr     = bs.pips_to_target / bs.risk_pips if bs.risk_pips > 0 else 0
+                st.markdown(
+                    f"<div style='padding:8px;border-radius:6px;"
+                    f"background:{d_col}22;border:1px solid {d_col};margin:4px 0'>"
+                    f"<b style='color:{d_col}'>{s_icon} {bs.direction}</b> · "
+                    f"{bs.strength} · R:R {rr:.1f}:1"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+                st.caption(bs.description)
+                z1, z2, z3 = st.columns(3)
+                z1.metric("Entry Zone",   f"{bs.entry_zone_low:.5f}")
+                z2.metric("Target",       f"{bs.target:.5f}",
+                          delta=f"+{bs.pips_to_target:.0f} pips")
+                z3.metric("Invalidation", f"{bs.invalidation:.5f}",
+                          delta=f"-{bs.risk_pips:.0f} pips", delta_color="inverse")
+
+            # ── All Order Blocks ──────────────────────────────────────────────
+            if _scalp.order_blocks:
+                st.markdown("**🟦 Order Blocks**")
+                for ob in _scalp.order_blocks:
+                    d_col = "#2d9e2d" if ob.direction == "BUY" else "#c9302c"
+                    rr    = ob.pips_to_target / ob.risk_pips if ob.risk_pips > 0 else 0
                     st.markdown(
-                        f"**{icon} {bs.setup_type.replace('_',' ')}** — "
-                        f":{d_col}[{bs.direction}] | {bs.strength}"
+                        f"<span style='color:{d_col}'>{'▲' if ob.direction=='BUY' else '▼'} "
+                        f"{ob.direction}</span> · Zone: `{ob.entry_zone_low:.5f}`–`{ob.entry_zone_high:.5f}` · "
+                        f"Target: `{ob.target:.5f}` · R:R {rr:.1f}:1 · {ob.strength}",
+                        unsafe_allow_html=True
                     )
-                    st.caption(bs.description)
-                    lc, rc = st.columns(2)
-                    lc.metric("Zone", f"{bs.entry_zone_low:.5f}–{bs.entry_zone_high:.5f}")
-                    rc.metric("Target", f"{bs.target:.5f}",
-                             delta=f"{bs.pips_to_target:.0f} pips")
-                    rr = bs.pips_to_target / bs.risk_pips if bs.risk_pips > 0 else 0
-                    st.caption(f"R:R = {rr:.1f}:1 | Risk: {bs.risk_pips:.0f} pips | "
-                              f"Invalidation: {bs.invalidation:.5f}")
 
-                # All setups summary
-                total = len(_scalp.order_blocks) + len(_scalp.fvgs) + len(_scalp.liq_sweeps)
-                if total > 1:
-                    st.caption(f"📋 {len(_scalp.order_blocks)} OB · "
-                              f"{len(_scalp.fvgs)} FVG · "
-                              f"{len(_scalp.liq_sweeps)} Sweep detected")
+            # ── All FVGs ─────────────────────────────────────────────────────
+            if _scalp.fvgs:
+                st.markdown("**⬜ Fair Value Gaps**")
+                for fvg in _scalp.fvgs:
+                    d_col = "#2d9e2d" if fvg.direction == "BUY" else "#c9302c"
+                    rr    = fvg.pips_to_target / fvg.risk_pips if fvg.risk_pips > 0 else 0
+                    st.markdown(
+                        f"<span style='color:{d_col}'>{'▲' if fvg.direction=='BUY' else '▼'} "
+                        f"{fvg.direction}</span> · Gap: `{fvg.entry_zone_low:.5f}`–`{fvg.entry_zone_high:.5f}` · "
+                        f"{fvg.pips_to_target:.0f} pips · R:R {rr:.1f}:1",
+                        unsafe_allow_html=True
+                    )
+
+            # ── Liquidity Sweeps ─────────────────────────────────────────────
+            if _scalp.liq_sweeps:
+                st.markdown("**💧 Liquidity Sweeps**")
+                for sw in _scalp.liq_sweeps:
+                    d_col = "#2d9e2d" if sw.direction == "BUY" else "#c9302c"
+                    rr    = sw.pips_to_target / sw.risk_pips if sw.risk_pips > 0 else 0
+                    st.markdown(
+                        f"<span style='color:{d_col}'>{'▲' if sw.direction=='BUY' else '▼'} "
+                        f"{sw.direction}</span> · {sw.description[:70]} · R:R {rr:.1f}:1",
+                        unsafe_allow_html=True
+                    )
 
         with st.expander("📊 Volume Profile Details"):
             c1, c2, c3 = st.columns(3)
