@@ -461,11 +461,77 @@ def _detect_vwap_setup(df_5m: pd.DataFrame, vwap: float,
         return None
 
 
+def _detect_vwap_setup_scaled(df_5m: pd.DataFrame, vwap_nas: float,
+                               current_price: float,
+                               ratio: float = 40.0) -> Optional[ScalpSetup]:
+    """
+    VWAP deviation scalp using NAS100-scaled prices.
+    vwap_nas and current_price are both in NAS100 index points.
+    Standard deviation bands calculated from QQQ then scaled.
+    """
+    if df_5m is None or vwap_nas is None:
+        return None
+    try:
+        df = df_5m.copy()
+        df.columns = [c.capitalize() for c in df.columns]
+        df.index   = pd.to_datetime(df.index, utc=True)
+        today = pd.Timestamp.now(tz='UTC').date()
+        df    = df[df.index.date == today]
+        if len(df) < 10:
+            return None
+
+        typical  = (df['High'] + df['Low'] + df['Close']) / 3
+        std_qqq  = typical.std()
+        std_nas  = std_qqq * ratio          # scale std to NAS100 points
+
+        upper_2  = vwap_nas + 2 * std_nas
+        lower_2  = vwap_nas - 2 * std_nas
+        dev_pct  = (current_price - vwap_nas) / vwap_nas * 100
+
+        if current_price > upper_2:
+            return ScalpSetup(
+                pair="NAS100", setup_type="VWAP_DEV", direction="SELL",
+                entry_zone_high=current_price + 15,
+                entry_zone_low=current_price - 15,
+                target=vwap_nas,
+                invalidation=upper_2 + std_nas,
+                strength="STRONG" if dev_pct > 0.5 else "MEDIUM",
+                description=(
+                    f"NAS100 {dev_pct:+.2f}% above VWAP ({vwap_nas:,.0f}). "
+                    f"Extended above 2σ band ({upper_2:,.0f}). "
+                    f"Target VWAP snap-back to {vwap_nas:,.0f}."
+                ),
+                pips_to_target=round(current_price - vwap_nas, 0),
+                risk_pips=round(std_nas, 0),
+            )
+        elif current_price < lower_2:
+            return ScalpSetup(
+                pair="NAS100", setup_type="VWAP_DEV", direction="BUY",
+                entry_zone_high=current_price + 15,
+                entry_zone_low=current_price - 15,
+                target=vwap_nas,
+                invalidation=lower_2 - std_nas,
+                strength="STRONG" if abs(dev_pct) > 0.5 else "MEDIUM",
+                description=(
+                    f"NAS100 {dev_pct:+.2f}% below VWAP ({vwap_nas:,.0f}). "
+                    f"Extended below 2σ band ({lower_2:,.0f}). "
+                    f"Target VWAP snap-back to {vwap_nas:,.0f}."
+                ),
+                pips_to_target=round(vwap_nas - current_price, 0),
+                risk_pips=round(std_nas, 0),
+            )
+        return None
+    except Exception as e:
+        print(f"[scalping] VWAP scaled error: {e}")
+        return None
+
+
 def _detect_gap_fill(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
-                      current_price: float) -> Optional[ScalpSetup]:
+                      current_price: float,
+                      ratio: float = 40.0) -> Optional[ScalpSetup]:
     """
     Gap Fill: today's open vs yesterday's close.
-    If gap exists, price tends to fill it within the session.
+    df_1d is QQQ data — prices scaled by ratio to NAS100 index points.
     """
     if df_1d is None or df_5m is None or len(df_1d) < 2:
         return None
@@ -475,8 +541,9 @@ def _detect_gap_fill(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
         df5 = df_5m.copy()
         df5.columns = [c.capitalize() for c in df5.columns]
 
-        prev_close  = float(df1['Close'].iloc[-2])
-        today_open  = float(df5['Open'].iloc[0])  # first 5m candle open
+        # Scale QQQ prices to NAS100 index points
+        prev_close  = float(df1['Close'].iloc[-2]) * ratio
+        today_open  = float(df5['Open'].iloc[0])   * ratio
         gap_size    = today_open - prev_close
         gap_pct     = abs(gap_size) / prev_close * 100
 
@@ -524,7 +591,8 @@ def _detect_gap_fill(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
 
 
 def _detect_key_levels(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
-                        current_price: float) -> tuple:
+                        current_price: float,
+                        ratio: float = 40.0) -> tuple:
     """
     Key level bounces: round numbers, daily high/low, prev close, prev day high/low.
     Returns (list of key levels, nearest setup or None).
@@ -533,12 +601,13 @@ def _detect_key_levels(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
     if df_1d is not None and len(df_1d) >= 2:
         df1 = df_1d.copy()
         df1.columns = [c.capitalize() for c in df1.columns]
+        # Scale QQQ prices to NAS100 index points
         levels.extend([
-            float(df1['High'].iloc[-1]),    # today's high
-            float(df1['Low'].iloc[-1]),     # today's low
-            float(df1['Close'].iloc[-2]),   # prev close
-            float(df1['High'].iloc[-2]),    # prev day high
-            float(df1['Low'].iloc[-2]),     # prev day low
+            float(df1['High'].iloc[-1])   * ratio,   # today's high
+            float(df1['Low'].iloc[-1])    * ratio,   # today's low
+            float(df1['Close'].iloc[-2])  * ratio,   # prev close
+            float(df1['High'].iloc[-2])   * ratio,   # prev day high
+            float(df1['Low'].iloc[-2])    * ratio,   # prev day low
         ])
 
     # Round numbers (every 500 pts for NAS100)
@@ -631,18 +700,31 @@ def analyse_forex_scalp(pair: str, df_1h: pd.DataFrame,
 
 def analyse_nas100_scalp(df_5m: pd.DataFrame,
                           df_1d: pd.DataFrame,
-                          current_price: float) -> ScalpReport:
-    """Run all NAS100 scalping detectors."""
+                          current_price: float,
+                          qqq_to_nas100_ratio: float = 40.0) -> ScalpReport:
+    """
+    Run all NAS100 scalping detectors.
+    current_price is NAS100 index points (~19000).
+    df_5m is QQQ data — VWAP calculated on QQQ then scaled to NAS100.
+    qqq_to_nas100_ratio: multiply QQQ price by this to get NAS100 index price.
+    """
     session = _get_session()
     report  = ScalpReport(ticker="NAS100", current_price=current_price, session=session)
 
-    report.vwap = _calc_vwap(df_5m)
+    _raw_vwap = _calc_vwap(df_5m)   # QQQ VWAP in ETF price (~$465)
+    # Scale QQQ VWAP to NAS100 index points
+    report.vwap = round(_raw_vwap * qqq_to_nas100_ratio, 0) if _raw_vwap else None
     if report.vwap:
-        report.vwap_deviation_pct = round((current_price - report.vwap) / report.vwap * 100, 3)
-        report.vwap_setup         = _detect_vwap_setup(df_5m, report.vwap, current_price)
+        report.vwap_deviation_pct = round(
+            (current_price - report.vwap) / report.vwap * 100, 3
+        )
+        # Pass scaled VWAP and current_price (both in NAS100 pts) to setup detector
+        report.vwap_setup = _detect_vwap_setup_scaled(
+            df_5m, report.vwap, current_price, qqq_to_nas100_ratio
+        )
 
-    report.gap_fill_setup = _detect_gap_fill(df_1d, df_5m, current_price)
-    report.key_levels, report.key_level_setup = _detect_key_levels(df_1d, df_5m, current_price)
+    report.gap_fill_setup = _detect_gap_fill(df_1d, df_5m, current_price, qqq_to_nas100_ratio)
+    report.key_levels, report.key_level_setup = _detect_key_levels(df_1d, df_5m, current_price, qqq_to_nas100_ratio)
     report.open_drive = _detect_open_drive(df_5m)
 
     # Best NAS100 setup
