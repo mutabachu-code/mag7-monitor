@@ -450,80 +450,99 @@ _nas_5m = get_5m(NAS100_LABEL)
 _nas_1d = get_1d(NAS100_LABEL)
 
 if _nas_5m is not None and nas_ind:
-    _nas_price = nas_ind['curr_p']          # already scaled to NAS100 index pts
-    _nas_ratio = get_qqq_ndx_ratio()        # QQQ→NAS100 multiplier (~40x)
-    _nas_scalp = analyse_nas100_scalp(_nas_5m, _nas_1d, _nas_price,
-                                      qqq_to_nas100_ratio=_nas_ratio)
+    try:
+        _nas_price = float(nas_ind['curr_p'])
+        _nas_ratio = float(get_qqq_ndx_ratio() or 40.0)
+        _nas_scalp = analyse_nas100_scalp(
+            _nas_5m,
+            _nas_1d if _nas_1d is not None else _nas_5m,
+            _nas_price,
+            qqq_to_nas100_ratio=_nas_ratio,
+        )
 
-    sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1, sc2, sc3, sc4 = st.columns(4)
 
-    # VWAP
-    with sc1:
-        st.markdown("**📊 VWAP**")
-        if _nas_scalp.vwap:
-            vwap_color = "green" if _nas_price > _nas_scalp.vwap else "red"
-            st.markdown(
-                f"<span style='font-size:1.2em;color:{'#2d9e2d' if _nas_price > _nas_scalp.vwap else '#c9302c'}'>"
-                f"{_nas_scalp.vwap:,.0f}</span>",
-                unsafe_allow_html=True
-            )
-            st.caption(f"Dev: {_nas_scalp.vwap_deviation_pct:+.2f}%")
-            if _nas_scalp.vwap_setup:
-                vs = _nas_scalp.vwap_setup
-                st.warning(f"⚡ VWAP {vs.direction} setup — {vs.description[:60]}...")
-        else:
-            st.caption("VWAP unavailable (pre-market)")
-
-    # Gap Fill
-    with sc2:
-        st.markdown("**📐 Gap Fill**")
-        if _nas_scalp.gap_fill_setup:
-            gs = _nas_scalp.gap_fill_setup
-            d_col = "#2d9e2d" if gs.direction == "BUY" else "#c9302c"
-            st.markdown(
-                f"<span style='color:{d_col};font-weight:bold'>{gs.direction}</span> "
-                f"→ {gs.target:,.0f}",
-                unsafe_allow_html=True
-            )
-            st.caption(gs.description[:80])
-        else:
-            st.caption("No gap today")
-
-    # Key Levels
-    with sc3:
-        st.markdown("**🔑 Key Levels**")
-        if _nas_scalp.key_levels:
-            nearest_levels = sorted(
-                _nas_scalp.key_levels,
-                key=lambda l: abs(l - _nas_price)
-            )[:3]
-            for lv in nearest_levels:
-                dist = lv - _nas_price
-                color = "#2d9e2d" if dist > 0 else "#c9302c"
+        with sc1:
+            st.markdown("**📊 VWAP**")
+            if _nas_scalp.vwap:
+                vwap_col = "#2d9e2d" if _nas_price > _nas_scalp.vwap else "#c9302c"
                 st.markdown(
-                    f"<span style='color:{color}'>{lv:,.0f} ({dist:+.0f})</span>",
+                    f"<span style='font-size:1.2em;font-weight:bold;color:{vwap_col}'>"
+                    f"{_nas_scalp.vwap:,.0f}</span>",
                     unsafe_allow_html=True
                 )
-        if _nas_scalp.key_level_setup:
-            kls = _nas_scalp.key_level_setup
-            st.warning(f"⚡ AT KEY LEVEL — {kls.direction} bounce setup")
+                st.caption(f"Dev: {_nas_scalp.vwap_deviation_pct:+.2f}%")
+                if _nas_scalp.vwap_setup:
+                    vs = _nas_scalp.vwap_setup
+                    d_col = "#2d9e2d" if vs.direction == "BUY" else "#c9302c"
+                    st.markdown(
+                        f"<span style='color:{d_col};font-weight:bold'>"
+                        f"⚡ VWAP {vs.direction} — {vs.strength}</span>",
+                        unsafe_allow_html=True
+                    )
+                    st.caption(vs.description[:100])
+            else:
+                st.caption("VWAP unavailable (pre-market or no volume)")
 
-    # Open Drive
-    with sc4:
-        st.markdown("**🚀 Open Drive**")
-        drive_colors = {
-            "BULLISH":  "#2d9e2d", "BEARISH": "#c9302c",
-            "CHOPPY":   "#e6a817", "PRE-OPEN": "#888",
-            "AWAITING": "#888",    "UNKNOWN":  "#888",
-        }
-        drive = _nas_scalp.open_drive or "UNKNOWN"
-        color = drive_colors.get(drive, "#888")
-        st.markdown(
-            f"<span style='font-size:1.3em;font-weight:bold;color:{color}'>"
-            f"{drive}</span>",
-            unsafe_allow_html=True
-        )
-        st.caption("First 15min NY direction bias")
+        with sc2:
+            st.markdown("**📐 Gap Fill**")
+            if _nas_scalp.gap_fill_setup:
+                gs    = _nas_scalp.gap_fill_setup
+                d_col = "#2d9e2d" if gs.direction == "BUY" else "#c9302c"
+                st.markdown(
+                    f"<span style='color:{d_col};font-weight:bold'>"
+                    f"{gs.direction} → {gs.target:,.0f}</span>",
+                    unsafe_allow_html=True
+                )
+                st.caption(gs.description[:100])
+                st.caption(f"R:R {gs.pips_to_target/gs.risk_pips:.1f}:1 | "
+                           f"Strength: {gs.strength}")
+            else:
+                st.caption("No significant gap today")
+
+        with sc3:
+            st.markdown("**🔑 Key Levels**")
+            if _nas_scalp.key_levels:
+                near = sorted(_nas_scalp.key_levels,
+                              key=lambda l: abs(l - _nas_price))[:4]
+                for lv in near:
+                    dist  = lv - _nas_price
+                    color = "#2d9e2d" if dist > 0 else "#c9302c"
+                    st.markdown(
+                        f"<span style='color:{color}'>"
+                        f"{lv:,.0f} ({dist:+.0f} pts)</span>",
+                        unsafe_allow_html=True
+                    )
+            if _nas_scalp.key_level_setup:
+                kls = _nas_scalp.key_level_setup
+                st.warning(f"⚡ AT KEY LEVEL — {kls.direction} bounce")
+
+        with sc4:
+            st.markdown("**🚀 Open Drive**")
+            drive_colors = {
+                "BULLISH":  "#2d9e2d", "BEARISH":  "#c9302c",
+                "CHOPPY":   "#e6a817", "PRE-OPEN": "#888888",
+                "AWAITING": "#888888", "UNKNOWN":  "#888888",
+            }
+            drive = _nas_scalp.open_drive or "UNKNOWN"
+            color = drive_colors.get(drive, "#888888")
+            st.markdown(
+                f"<span style='font-size:1.3em;font-weight:bold;color:{color}'>"
+                f"{drive}</span>",
+                unsafe_allow_html=True
+            )
+            st.caption("First 15min NY direction bias")
+            if drive == "BULLISH":
+                st.success("Favour LONG scalps with VWAP support")
+            elif drive == "BEARISH":
+                st.error("Favour SHORT scalps below VWAP")
+            elif drive == "CHOPPY":
+                st.warning("Avoid momentum — range scalp only")
+
+    except Exception as _se:
+        st.warning(f"NAS100 scalping unavailable: {_se}")
+else:
+    st.caption("NAS100 data not yet loaded.")
 
 st.divider()
 
