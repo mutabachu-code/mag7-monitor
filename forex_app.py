@@ -1,538 +1,484 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from scipy.stats import norm
-from streamlit_autorefresh import st_autorefresh
+import time
 from datetime import datetime, timezone
+from streamlit_autorefresh import st_autorefresh
 
-from data_fetcher import fetch_all_data, get_5m, get_1h, get_1d, get_vix, get_heatmap_data, get_qqq_ndx_ratio, get_gold_df, get_macro_df, MAG7
-from macro_monitor import render_macro_panel, get_macro_snapshot
-from regime_detector import detect_regime_stocks, render_regime_panel, render_regime_badge
-from scalping_engine import analyse_nas100_scalp
-from iv_calculator import get_iv_data
-from claude_analyst import analyse
-from risk_manager import RiskConfig, init_risk_state, render_risk_sidebar, check_trade_allowed, record_trade_opened
+from forex_data_fetcher import fetch_all_pairs, get_1h, get_4h, get_1d, get_pip, PAIRS, get_fx_gold_df, get_fx_macro
+from forex_volume_profile import compute_volume_profile
+from forex_analyst import analyse_pair, FXSignal
+from macro_monitor import get_macro_snapshot
+from regime_detector import detect_regime_forex, render_regime_panel, render_regime_badge
+from scalping_engine import analyse_forex_scalp, ScalpSetup
 
-# ── SETUP ─────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Mag 7 + NAS100 Monitor", layout="wide")
-init_risk_state()
-st_autorefresh(interval=60000, key="datarefresh")
-
-risk_config = RiskConfig(
-    account_size_usd=100.0,
-    lot_size=0.02,
-    daily_loss_limit_pct=5.0,
-    max_trades_per_day=3,
-)
-risk_config = render_risk_sidebar(risk_config)
-
-st.title("🛡️ Mag 7 + NAS100 MTF Monitor + Claude AI")
-st.caption(
-    f"Last Update: {pd.Timestamp.now().strftime('%H:%M:%S')} | "
-    "5m Signals · 1H MACD · IV Analysis · Claude AI"
-)
-
-NAS100_LABEL = 'NAS100'
+# ── PAGE CONFIG ───────────────────────────────────────────────────────────────
+st.set_page_config(page_title="FX Major Pairs Monitor", layout="wide", page_icon="💱")
+st_autorefresh(interval=60000, key="fx_refresh")
 
 
 # ── SESSION GATE ──────────────────────────────────────────────────────────────
-def _claude_allowed_stocks() -> tuple:
+def _claude_allowed_forex(pair: str = "") -> tuple:
     """
-    Gate Claude calls to NY market hours only.
-    Saves API costs outside trading hours.
-    Returns (allowed: bool, reason: str, prime_time: bool)
+    Gate Claude to London Open + London/NY Overlap only.
+    During NY-only session, only USD pairs get analysed.
+    Returns (allowed: bool, reason: str)
     """
-    utc   = datetime.now(timezone.utc)
-    start = utc.replace(hour=14, minute=30, second=0, microsecond=0)
-    end   = utc.replace(hour=21, minute=0,  second=0, microsecond=0)
-    prime = utc.replace(hour=16, minute=0,  second=0, microsecond=0)
-    wday  = utc.weekday()
+    utc  = datetime.now(timezone.utc)
+    h    = utc.hour
+    wday = utc.weekday()
 
     if wday >= 5:
-        return False, "🔴 Weekend — Claude resumes Monday 14:30 UTC", False
-    if utc < start:
-        mins = int((start - utc).total_seconds() / 60)
-        return False, f"🕐 Claude activates at NY Open in {mins} min (14:30 UTC / 17:30 Nairobi)", False
-    if utc > end:
-        return False, "🔴 NY closed — Claude resumes tomorrow 14:30 UTC", False
-    if utc <= prime:
-        return True, "🟢 NY Open — Prime Time · Claude ACTIVE", True
-    return True, "🟡 NY Mid-Session · Claude active (strong signals only)", False
+        return False, "🔴 Forex weekend — Claude resumes Monday 07:00 UTC"
+    if 7 <= h < 12:
+        return True,  "🟢 London Open — Claude ACTIVE"
+    if 12 <= h < 17:
+        return True,  "🟢 London/NY Overlap — Claude ACTIVE (peak liquidity)"
+    if 17 <= h < 21:
+        if pair and 'USD' not in pair:
+            return False, f"🟡 NY Session — skipping {pair} (not a USD pair)"
+        return True, "🟡 NY Session — USD pairs only"
+    if h < 7:
+        mins = (7 - h) * 60 - utc.minute
+        return False, f"🕐 Asian Session — Claude activates at London Open in {mins}min (07:00 UTC)"
+    return False, "🔴 After-hours — Claude resumes at London Open (07:00 UTC)"
 
 
-# ── HELPERS ───────────────────────────────────────────────────────────────────
-def get_bs_delta(S, K, T, r, sigma):
-    if T <= 0 or sigma <= 0 or S <= 0:
-        return 0.5
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    return norm.cdf(d1)
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
+st.sidebar.header("⚙️ FX Risk Controls")
 
+for key, default in [
+    ("fx_kill", False), ("fx_daily_pnl", 0.0),
+    ("fx_trades_today", 0), ("fx_open_pair", None), ("fx_trade_log", [])
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-# ── DATA FETCH ────────────────────────────────────────────────────────────────
-import time as _time
-fetch_start = _time.time()
-with st.spinner("Fetching market data..."):
-    data_ok = fetch_all_data()
-fetch_elapsed = _time.time() - fetch_start
-
-if not data_ok:
-    has_stale = any(
-        st.session_state.get(f"df_5m_{t}") is not None
-        for t in ([NAS100_LABEL] + MAG7)
-    )
-    if has_stale:
-        st.warning("⚠️ Live fetch failed — showing last known prices. Retrying next refresh.")
+if st.session_state.fx_kill:
+    st.sidebar.error("🔴 KILL SWITCH: ON")
+    if st.sidebar.button("🟢 Resume Trading", type="primary"):
+        st.session_state.fx_kill = False; st.rerun()
+else:
+    if st.session_state.fx_open_pair:
+        st.sidebar.warning(f"📊 Open: **{st.session_state.fx_open_pair}**")
     else:
-        st.error("⚠️ No market data available. Market may be closed or yfinance is rate-limited.")
-        st.stop()
-elif fetch_elapsed > 15:
-    st.caption(f"⏱️ Data loaded in {fetch_elapsed:.0f}s")
+        st.sidebar.success("🟢 Bot ACTIVE — No open position")
+    if st.sidebar.button("🔴 HALT Trading", type="secondary"):
+        st.session_state.fx_kill = True; st.rerun()
 
-vix_value = get_vix()
+st.sidebar.divider()
+pnl = st.session_state.fx_daily_pnl
+st.sidebar.markdown(f"**Daily P&L:** :{'green' if pnl >= 0 else 'red'}[${pnl:+.2f}]")
+st.sidebar.markdown(f"**Trades today:** {st.session_state.fx_trades_today} / 3")
 
-# ── COMPUTE GLOBAL REGIME (shared across all ticker cards) ───────────────────
-_macro_snap  = get_macro_snapshot()
-_gold_df     = get_gold_df()
-_tnx_df      = get_macro_df("tnx")
-_global_regime = detect_regime_stocks(
-    vix=vix_value,
-    macro_risk_score=_macro_snap.risk_score if _macro_snap else None,
-    breadth_ratio=_macro_snap.breadth_ratio if _macro_snap else None,
-    gold_df=_gold_df,
-    tnx_df=_tnx_df,
+st.sidebar.divider()
+account_size = st.sidebar.number_input("Account size (USD)", 10.0, 10000.0, 100.0, 10.0)
+lot_size     = st.sidebar.select_slider("Lot size", [0.01, 0.02, 0.03, 0.05], 0.02)
+daily_limit  = st.sidebar.slider("Daily loss limit (%)", 1.0, 10.0, 5.0, 0.5)
+
+if st.session_state.fx_trade_log:
+    st.sidebar.divider()
+    st.sidebar.markdown("**Today's trades**")
+    st.sidebar.dataframe(
+        pd.DataFrame(st.session_state.fx_trade_log),
+        hide_index=True, use_container_width=True
+    )
+
+# ── HEADER ────────────────────────────────────────────────────────────────────
+st.title("💱 FX Major Pairs — Volume Profile + Claude AI")
+st.caption(
+    f"Last Update: {pd.Timestamp.now().strftime('%H:%M:%S')} | "
+    "Volume Profile (1H) · POC/VAH/VAL · Mean Reversion & Breakout · Claude Sentiment"
 )
 
+# ── FOREX SESSION STATUS ──────────────────────────────────────────────────────
+utc      = datetime.now(timezone.utc)
+utc_h    = utc.hour
+utc_wday = utc.weekday()
+utc_str  = utc.strftime("%H:%M UTC")
 
-# ── HEATMAP ───────────────────────────────────────────────────────────────────
-def render_heatmap():
-    st.subheader("📊 NAS100 + Mag 7 Hourly Heatmap")
+if utc_wday >= 5:
+    st.error(f"🔴 FOREX CLOSED (Weekend) · {utc_str}")
+elif 22 <= utc_h or utc_h < 7:
+    st.warning(f"🟡 Asian Session · {utc_str} — Low liquidity on majors")
+elif 7 <= utc_h < 12:
+    st.success(f"🟢 London Session OPEN · {utc_str}")
+elif 12 <= utc_h < 17:
+    st.success(f"🟢 London + NY Overlap (PEAK LIQUIDITY) · {utc_str}")
+elif 17 <= utc_h < 21:
+    st.warning(f"🟡 New York Session · {utc_str}")
+else:
+    st.warning(f"🟡 Market transitioning · {utc_str}")
 
-    # Market status
-    utc      = datetime.now(timezone.utc)
-    ny_hour  = (utc.hour - 4) % 24
-    ny_wday  = utc.weekday()
-    ny_str   = f"{ny_hour:02d}:{utc.minute:02d} NY time"
+# ── 10Y YIELD PANEL ─────────────────────────────────────────────────────────
+macro = get_macro_snapshot()
+if macro:
+    yield_col, oil_col, breadth_col, score_col = st.columns(4)
+    with yield_col:
+        st.metric("🏦 US 10Y Yield", f"{macro.yield_10y:.2f}%",
+                  delta=f"{macro.yield_signal}", delta_color="off")
+    with oil_col:
+        st.metric("🛢️ Brent Crude", f"${macro.oil_price:.1f}",
+                  delta=macro.oil_signal, delta_color="off")
+    with breadth_col:
+        st.metric("📊 Breadth", f"QQQ vs QQQE",
+                  delta=macro.breadth_signal.split("—")[0].strip(), delta_color="off")
+    with score_col:
+        st.metric("⚡ Risk Score", f"{macro.risk_score}/100",
+                  delta=macro.risk_icon + " " + macro.risk_level.split(":")[0],
+                  delta_color="off")
 
-    if ny_wday >= 5:
-        st.error(f"🔴 Market CLOSED (Weekend) · {ny_str}")
-    elif (ny_hour == 9 and utc.minute >= 30) or (10 <= ny_hour < 16):
-        st.success(f"🟢 Market OPEN — Live data · {ny_str}")
-    elif ny_hour < 9 or (ny_hour == 9 and utc.minute < 30):
-        opens_in = (9 * 60 + 30) - (ny_hour * 60 + utc.minute)
-        st.warning(f"🟡 Pre-Market — Opens in {opens_in}min · Showing last session data · {ny_str}")
-    else:
-        st.error(f"🔴 After-Market CLOSED · {ny_str}")
+    # Yield filter warning for forex
+    if macro.yield_10y > 4.50:
+        st.warning(
+            f"⚠️ **Yield Trap Active** ({macro.yield_10y:.2f}%) — "
+            "Mean Reversion BUY signals on USD pairs may be unreliable. "
+            "Yields at this level support USD strength — favour BREAKOUT BUY on USDJPY/USDCHF."
+        )
+    if "EXHAUSTION" in macro.breadth_signal:
+        st.error("🔴 Market Breadth Exhaustion detected — risk-off environment. Favour CHF/JPY safety flows.")
 
-    st.caption("Hourly % returns · Green = up · Red = down · Intensity = magnitude")
+st.divider()
 
-    rows = []
-    for label in [NAS100_LABEL] + MAG7:
-        df = get_heatmap_data(label)
-        if df is None or df.empty:
-            continue
-        try:
+# ── FETCH DATA ────────────────────────────────────────────────────────────────
+with st.spinner("Fetching forex data..."):
+    data_ok = fetch_all_pairs()
+
+if not data_ok:
+    st.error("⚠️ Forex data unavailable. Retrying on next refresh.")
+    st.stop()
+
+# ── GLOBAL FOREX REGIME ───────────────────────────────────────────────────────
+_fx_macro  = get_macro_snapshot()
+_fx_gold   = get_fx_gold_df()
+_fx_tnx    = get_fx_macro("tnx")
+_fx_jpy    = get_fx_macro("usdjpy") if hasattr(get_fx_macro, "__call__") else None
+
+# Use USDJPY 1h as JPY proxy for cross-asset check
+from forex_data_fetcher import get_1h as fx_get_1h
+_fx_jpy_df = fx_get_1h("USDJPY")
+
+_global_fx_regime = detect_regime_forex(
+    vix=_fx_macro.yield_10y if _fx_macro else None,
+    macro_risk_score=_fx_macro.risk_score if _fx_macro else None,
+    gold_df=_fx_gold,
+    jpy_df=_fx_jpy_df,
+    tnx_df=_fx_tnx,
+)
+
+# ── CORRELATION MATRIX ────────────────────────────────────────────────────────
+render_regime_panel(_global_fx_regime, "Forex Market Regime")
+
+def render_correlation_matrix():
+    st.subheader("🔗 Correlation Matrix — Lead/Lag Analysis")
+    st.caption("Values near +1.0 = highly correlated · Near -1.0 = inverse · Find the 'Leader' pair")
+
+    closes = {}
+    for pair in PAIRS:
+        df = get_1h(pair)
+        if df is not None and not df.empty:
             df.columns = [c.capitalize() for c in df.columns]
-            if 'Close' not in df.columns:
-                continue
-            closes      = df['Close'].dropna().tail(8)
-            if len(closes) < 2:
-                continue
-            pct_changes = closes.pct_change().dropna() * 100
-            row = {"Ticker": "NAS100(QQQ)" if label == NAS100_LABEL else label,
-                   "Price":  round(float(closes.iloc[-1]), 2)}
-            for j, (_, val) in enumerate(pct_changes.items()):
-                row[f"H{j+1}"] = round(float(val), 2)
-            row["Day %"] = round(float(
-                (closes.iloc[-1] - closes.iloc[0]) / closes.iloc[0] * 100), 2)
-            rows.append(row)
-        except Exception as e:
-            print(f"[heatmap] {label}: {e}")
+            closes[pair] = df['Close'].tail(48)
 
-    if not rows:
-        st.warning("Heatmap data unavailable — market may be closed.")
+    if len(closes) < 2:
+        st.warning("Insufficient data for correlation matrix.")
         return
 
-    df_hm     = pd.DataFrame(rows).set_index("Ticker")
-    hour_cols = sorted([c for c in df_hm.columns if c.startswith("H")])
-    for h in hour_cols:
-        df_hm[h] = pd.to_numeric(df_hm[h], errors='coerce').fillna(0)
-    df_hm["Day %"] = pd.to_numeric(df_hm["Day %"], errors='coerce').fillna(0)
+    df_closes = pd.DataFrame(closes).dropna()
+    corr      = df_closes.pct_change().dropna().corr().round(2)
 
-    def color_cell(val):
+    def color_corr(val):
         try:
             v = float(val)
+            if v == 1.0:   return "background-color:#333;color:#333"
+            elif v > 0.7:  return "background-color:#1a5c1a;color:white"
+            elif v > 0.3:  return "background-color:#2d7a2d;color:white"
+            elif v > -0.3: return "background-color:#555;color:white"
+            elif v > -0.7: return "background-color:#7a2d2d;color:white"
+            else:           return "background-color:#5c1a1a;color:white"
         except:
             return ""
-        if v > 1.5:    return "background-color:#1a7a1a;color:white"
-        elif v > 0.5:  return "background-color:#2d9e2d;color:white"
-        elif v > 0.1:  return "background-color:#5cb85c;color:white"
-        elif v > -0.1: return "background-color:#888;color:white"
-        elif v > -0.5: return "background-color:#d9534f;color:white"
-        elif v > -1.5: return "background-color:#c9302c;color:white"
-        else:          return "background-color:#8b0000;color:white"
 
-    fmt = {"Price": "${:,.2f}", "Day %": "{:+.2f}%"}
-    fmt.update({h: "{:+.2f}%" for h in hour_cols})
-
-    styled = (
-        df_hm[["Price", "Day %"] + hour_cols]
-        .style.map(color_cell, subset=["Day %"] + hour_cols)
-        .format(fmt)
+    st.dataframe(
+        corr.style.map(color_corr).format("{:.2f}"),
+        use_container_width=True
     )
-    st.dataframe(styled, use_container_width=True, height=320)
+    st.caption("🟢 Strong positive (move together) · 🔴 Strong negative (inverse pairs)")
     st.divider()
 
 
-# ── INDICATOR ENGINE ──────────────────────────────────────────────────────────
-def compute_indicators(label: str):
-    df_5m = get_5m(label)
-    df_1h = get_1h(label)
-    df_1d = get_1d(label)
+render_correlation_matrix()
 
-    if df_5m is None or df_1h is None:
-        return None
-    if len(df_1h) < 200 or len(df_5m) < 20:
-        return None
+# ── VOLUME PROFILE SUMMARY TABLE ──────────────────────────────────────────────
+st.subheader("📊 Volume Profile Overview")
+st.caption("POC = Fair Value · VAH/VAL = Value Area edges · Signal colour = trade type")
 
-    sma200_1h    = df_1h['Close'].rolling(window=200).mean().iloc[-1]
-    curr_p       = df_5m['Close'].iloc[-1]
-    prev_p       = df_5m['Close'].iloc[-2]
+vp_data      = {}
+summary_rows = []
 
-    # Scale QQQ → NAS100 index price
-    if label == NAS100_LABEL:
-        ratio     = get_qqq_ndx_ratio()
-        curr_p    = round(curr_p    * ratio, 0)
-        prev_p    = round(prev_p    * ratio, 0)
-        sma200_1h = round(sma200_1h * ratio, 0)
+for pair in PAIRS:
+    vp = compute_volume_profile(pair, get_1h(pair), get_4h(pair), get_1d(pair))
+    if vp:
+        vp_data[pair] = vp
+        summary_rows.append({
+            "Pair":     pair,
+            "Price":    f"{vp.current_price:.5f}",
+            "Day %":    f"{vp.day_pct:+.2f}%",
+            "POC":      f"{vp.poc:.5f}",
+            "VAH":      f"{vp.vah:.5f}",
+            "VAL":      f"{vp.val:.5f}",
+            "Location": vp.price_location.replace("_", " "),
+            "RSI":      f"{vp.rsi_1h:.0f}",
+            "ATR%":     f"{vp.atr_pct*100:.3f}%",
+            "Signal":   f"{vp.signal_icon} {vp.signal}",
+        })
 
-    trend_status = "BULLISH" if curr_p > sma200_1h else "BEARISH"
-    trend_color  = "green"   if trend_status == "BULLISH" else "red"
+if summary_rows:
+    df_summary = pd.DataFrame(summary_rows).set_index("Pair")
 
-    ema12        = df_1h['Close'].ewm(span=12, adjust=False).mean()
-    ema26        = df_1h['Close'].ewm(span=26, adjust=False).mean()
-    macd_line    = ema12 - ema26
-    signal_line  = macd_line.ewm(span=9, adjust=False).mean()
-    macd_bullish = macd_line.iloc[-1] > signal_line.iloc[-1]
+    def color_signal(val):
+        v = str(val)
+        if "MEAN REVERSION BUY"  in v: return "background-color:#1a3a5c;color:#88bbff"
+        if "MEAN REVERSION SELL" in v: return "background-color:#1a3a5c;color:#88bbff"
+        if "MEAN REVERSION"      in v: return "background-color:#1a3a5c;color:#88bbff"
+        if "BREAKOUT BUY"        in v: return "background-color:#1a4a1a;color:#88ff88"
+        if "BREAKOUT SELL"       in v: return "background-color:#4a1a1a;color:#ff8888"
+        if "HIGH RISK"           in v: return "background-color:#333;color:#888"
+        if "INTERVENTION"        in v: return "background-color:#4a0000;color:#ff4444"
+        if "POC LEVEL"           in v: return "background-color:#3a2a00;color:#ffcc44"
+        return ""
 
-    delta_p    = df_5m['Close'].diff()
-    gain       = (delta_p.where(delta_p > 0, 0)).rolling(window=14).mean()
-    loss       = (-delta_p.where(delta_p < 0, 0)).rolling(window=14).mean()
-    rs         = gain / loss
-    rsi_series = 100 - (100 / (1 + rs))
-    rsi        = rsi_series.iloc[-1]
+    def color_day(val):
+        try:
+            v = float(str(val).replace('%', ''))
+            if v > 0.3:    return "color:#44ff44;font-weight:bold"
+            elif v < -0.3: return "color:#ff4444;font-weight:bold"
+        except:
+            pass
+        return ""
 
-    df_5m      = df_5m.copy()
-    df_5m['vol_ma_long']  = df_5m['Volume'].rolling(window=20).mean()
-    df_5m['vol_ma_short'] = df_5m['Volume'].rolling(window=5).mean()
-    vol_ratio = (
-        df_5m['vol_ma_short'].iloc[-1] / df_5m['vol_ma_long'].iloc[-1]
-        if df_5m['vol_ma_long'].iloc[-1] > 0 else 1.0
+    st.dataframe(
+        df_summary.style
+        .map(color_signal, subset=["Signal"])
+        .map(color_day,    subset=["Day %"]),
+        use_container_width=True, height=300
     )
 
-    start_price = df_5m['Open'].iloc[0]
-    ann_vol     = df_5m['Close'].pct_change().std() * np.sqrt(252 * 78)
-    delta_val   = get_bs_delta(curr_p, start_price, 1/252, 0.045, ann_vol)
+st.divider()
 
-    # RSI momentum
-    rsi_prev   = rsi_series.iloc[-6] if len(rsi_series) >= 6 else rsi
-    rsi_rising = rsi > rsi_prev
-    rsi_falling= rsi < rsi_prev
-    price_mom  = (curr_p - df_5m['Close'].iloc[-13]) / df_5m['Close'].iloc[-13] * 100 if len(df_5m) >= 13 else 0
+# ── PAIR CARDS ────────────────────────────────────────────────────────────────
+st.subheader("🔍 Pair Detail + Claude AI Analysis")
+cols = st.columns(3)
 
-    # Signal logic
-    if curr_p > sma200_1h and rsi < 40 and vol_ratio > 1.1 and macd_bullish:
-        signal    = "🟢 STRONG BUY — Dip (Full Confluence)"
-        sig_color = "green"
-    elif (curr_p > sma200_1h and rsi > 60 and rsi < 80
-          and rsi_rising and vol_ratio > 1.3 and macd_bullish and price_mom > 0.3):
-        signal    = "🚀 MOMENTUM BUY — Breakout"
-        sig_color = "green"
-    elif curr_p < sma200_1h and rsi > 60 and vol_ratio > 1.1 and not macd_bullish:
-        signal    = "🔴 STRONG SELL (Full Confluence)"
-        sig_color = "red"
-    elif (curr_p < sma200_1h and rsi < 40 and rsi > 20
-          and rsi_falling and vol_ratio > 1.3 and not macd_bullish and price_mom < -0.3):
-        signal    = "💥 MOMENTUM SELL — Breakdown"
-        sig_color = "red"
-    elif curr_p > sma200_1h and rsi < 35:
-        signal    = "🟡 Caution Buy (No MACD Confirm)"
-        sig_color = "orange"
-    elif curr_p > sma200_1h and rsi > 75 and vol_ratio < 0.8:
-        signal    = "⚠️ Overbought — Watch for Reversal"
-        sig_color = "orange"
-    else:
-        signal    = "⚪ Neutral"
-        sig_color = "gray"
+for idx, pair in enumerate(PAIRS):
+    vp = vp_data.get(pair)
+    with cols[idx % 3]:
+        if vp is None:
+            st.warning(f"{pair}: Data unavailable")
+            st.divider()
+            continue
 
-    iv = get_iv_data(label, curr_p, df_1d, vix_value)
-
-    return dict(
-        label=label, curr_p=curr_p, prev_p=prev_p,
-        sma200_1h=sma200_1h, trend_status=trend_status, trend_color=trend_color,
-        macd_bullish=macd_bullish, rsi=rsi, vol_ratio=vol_ratio,
-        delta_val=delta_val, signal=signal, sig_color=sig_color, iv=iv,
-    )
-
-
-# ── TICKER CARD ───────────────────────────────────────────────────────────────
-def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
-    with col:
+        # Price header
+        pip        = get_pip(pair)
+        delta_pips = (vp.current_price - vp.prev_price) / pip
         st.metric(
-            label=ind["label"],
-            value=f"${ind['curr_p']:,.2f}",
-            delta=f"{ind['curr_p'] - ind['prev_p']:.2f}",
+            label=f"💱 {pair}",
+            value=f"{vp.current_price:.5f}",
+            delta=f"{delta_pips:+.1f} pips",
         )
-        st.markdown(f"**Trend (1H SMA200):** :{ind['trend_color']}[{ind['trend_status']}]")
-        st.markdown(f"**Signal:** :{ind['sig_color']}[{ind['signal']}]")
 
-        with st.expander("Technical Details"):
-            st.write(f"RSI (5m): {ind['rsi']:.1f}")
-            st.write(f"Vol Surge: {ind['vol_ratio']:.2f}x")
-            st.write(f"Opt. Delta: {ind['delta_val']:.2f}")
-            st.write(f"MACD: {'Bullish 📈' if ind['macd_bullish'] else 'Bearish 📉'}")
-            iv = ind.get('iv')
-            if iv:
-                st.markdown("---")
-                src = {'vix_proxy':'VIX','options':'options','historical':'hist vol'}.get(iv.source, iv.source)
-                st.markdown(
-                    f"**IV:** <span style='color:{iv.iv_color};font-weight:bold'>"
-                    f"{iv.current_iv:.1f}%</span> — **{iv.iv_label}** *({src})*",
-                    unsafe_allow_html=True,
-                )
-                c1, c2 = st.columns(2)
-                c1.metric("IV Rank",       f"{iv.iv_rank:.0f}/100")
-                c2.metric("IV Percentile", f"{iv.iv_percentile:.0f}%")
-                st.progress(
-                    int(min(iv.iv_rank, 100)) / 100,
-                    text=f"IV Rank: {iv.iv_rank:.0f}% of 52w range"
-                )
+        trend_tag  = "🟢 BULLISH" if vp.trend_bullish   else "🔴 BEARISH"
+        trend4h    = "🟢 Bull"    if vp.trend_4h_bullish else "🔴 Bear"
+        st.markdown(f"**Trend:** {trend_tag} (Daily) · {trend4h} (4H)")
 
-        if ind["signal"] != "⚪ Neutral":
+        sig_color_map = {
+            "MEAN REVERSION BUY":  "blue",
+            "MEAN REVERSION SELL": "blue",
+            "MEAN REVERSION":      "blue",
+            "BREAKOUT BUY":        "green",
+            "BREAKOUT SELL":       "red",
+            "HIGH RISK":           "gray",
+            "INTERVENTION RISK":   "red",
+            "POC LEVEL":           "orange",
+        }
+        sc = "gray"
+        for k, v in sig_color_map.items():
+            if k in vp.signal: sc = v; break
+        st.markdown(f"**Signal:** :{sc}[{vp.signal_icon} {vp.signal}]")
+        # Per-pair regime
+        _pair_regime = detect_regime_forex(
+            vix=None, atr_pct=vp.atr_pct, pair=pair,
+            trend_bullish=vp.trend_bullish, rsi=vp.rsi_1h,
+            vol_intensity=vp.volume_intensity,
+            macro_risk_score=_fx_macro.risk_score if _fx_macro else None,
+            gold_df=_fx_gold, jpy_df=_fx_jpy_df, tnx_df=_fx_tnx,
+        )
+        render_regime_badge(_pair_regime)
+
+        # ── SCALPING SETUPS ───────────────────────────────────────────────────
+        _scalp = analyse_forex_scalp(pair, get_1h(pair), vp.current_price)
+        if _scalp.best_setup or _scalp.asian_range:
+            with st.expander("🎯 Scalping Setups", expanded=False):
+                # Asian Range
+                ar = _scalp.asian_range
+                if ar:
+                    st.markdown(f"**Asian Range:** {ar['low']:.5f} — {ar['high']:.5f} "
+                               f"({ar['range_pips']:.0f} pips)")
+                    st.caption(ar['status'])
+
+                # Best setup
+                bs = _scalp.best_setup
+                if bs:
+                    icons = {"ORDER_BLOCK":"🟦","FVG":"⬜","LIQ_SWEEP":"💧"}
+                    icon  = icons.get(bs.setup_type, "🎯")
+                    d_col = "green" if bs.direction == "BUY" else "red"
+                    st.markdown(
+                        f"**{icon} {bs.setup_type.replace('_',' ')}** — "
+                        f":{d_col}[{bs.direction}] | {bs.strength}"
+                    )
+                    st.caption(bs.description)
+                    lc, rc = st.columns(2)
+                    lc.metric("Zone", f"{bs.entry_zone_low:.5f}–{bs.entry_zone_high:.5f}")
+                    rc.metric("Target", f"{bs.target:.5f}",
+                             delta=f"{bs.pips_to_target:.0f} pips")
+                    rr = bs.pips_to_target / bs.risk_pips if bs.risk_pips > 0 else 0
+                    st.caption(f"R:R = {rr:.1f}:1 | Risk: {bs.risk_pips:.0f} pips | "
+                              f"Invalidation: {bs.invalidation:.5f}")
+
+                # All setups summary
+                total = len(_scalp.order_blocks) + len(_scalp.fvgs) + len(_scalp.liq_sweeps)
+                if total > 1:
+                    st.caption(f"📋 {len(_scalp.order_blocks)} OB · "
+                              f"{len(_scalp.fvgs)} FVG · "
+                              f"{len(_scalp.liq_sweeps)} Sweep detected")
+
+        with st.expander("📊 Volume Profile Details"):
+            c1, c2, c3 = st.columns(3)
+            c1.metric("POC", f"{vp.poc:.5f}")
+            c2.metric("VAH", f"{vp.vah:.5f}")
+            c3.metric("VAL", f"{vp.val:.5f}")
+            st.write(f"**Location:** {vp.price_location.replace('_', ' ')}")
+            st.write(f"**RSI (1H):** {vp.rsi_1h:.1f}")
+            st.write(f"**ATR:** {vp.atr:.5f} ({vp.atr_pct*100:.3f}%)")
+            st.write(f"**Vol Intensity:** {vp.volume_intensity:.2f} "
+                     f"{'⚠️ Exhaustion' if vp.volume_intensity < 0.7 else '✅ Normal'}")
+            st.write(f"**SMA 50 (4H):** {vp.sma50_4h:.5f}")
+            st.write(f"**SMA 200 (D):** {vp.sma200_1d:.5f}")
+            if vp.hvns:
+                st.write(f"**HVN:** {', '.join([f'{p:.5f}' for p in vp.hvns[:3]])}")
+            if vp.lvns:
+                st.write(f"**LVN:** {', '.join([f'{p:.5f}' for p in vp.lvns[:3]])}")
+
+        # Claude AI Analysis
+        skip_signals   = ["NEUTRAL — Inside VA", "HIGH RISK"]
+        should_analyse = not any(s in vp.signal for s in skip_signals)
+
+        if should_analyse:
             with st.expander("🤖 Claude AI Analysis", expanded=True):
 
-                # ── SESSION GATE ──────────────────────────────────────────────
-                session_ok, session_msg, prime_time = _claude_allowed_stocks()
-
-                # Mid-session: only fire on STRONG/MOMENTUM signals
-                if session_ok and not prime_time:
-                    weak = any(w in ind["signal"] for w in ["Caution", "Overbought"])
-                    if weak:
-                        session_ok  = False
-                        session_msg = "🟡 Mid-session — Claude fires on STRONG signals only"
+                session_ok, session_msg = _claude_allowed_forex(pair)
 
                 if not session_ok:
                     st.caption(session_msg)
-                elif _global_regime.state == 2:
-                    st.error(f"🔴 {_global_regime.icon} CRISIS regime — no new entries. {_global_regime.strategy_note}")
+                elif _global_fx_regime.state == 2 and not _global_fx_regime.allowed_signals:
+                    st.error(f"🔴 CRISIS regime — {_global_fx_regime.strategy_note}")
                 else:
-                    trade_allowed, trade_reason = check_trade_allowed(risk_config, ind["label"])
+                    # Risk checks
+                    trade_allowed = True
+                    block_reason  = ""
+                    if st.session_state.fx_kill:
+                        trade_allowed = False
+                        block_reason  = "🔴 Kill switch ON"
+                    elif st.session_state.fx_open_pair and st.session_state.fx_open_pair != pair:
+                        trade_allowed = False
+                        block_reason  = f"⚠️ Position open on {st.session_state.fx_open_pair}"
+                    elif st.session_state.fx_trades_today >= 3:
+                        trade_allowed = False
+                        block_reason  = "⚠️ Max 3 trades/day reached"
+                    elif abs(min(st.session_state.fx_daily_pnl, 0)) / account_size * 100 >= daily_limit:
+                        trade_allowed = False
+                        block_reason  = "🔴 Daily loss limit reached"
 
-                    iv     = ind.get('iv')
-                    iv_str = (
-                        f"{iv.current_iv:.1f}% (Rank {iv.iv_rank:.0f}/100, {iv.iv_label})"
-                        if iv else "unavailable"
-                    )
+                    # Build yield context for forex Claude prompt
+                    macro_fx = get_macro_snapshot()
+                    yield_ctx = (
+                        f"10Y Yield: {macro_fx.yield_10y:.2f}% ({macro_fx.yield_signal}) | "
+                        f"Risk Score: {macro_fx.risk_score}/100 ({macro_fx.risk_level})"
+                    ) if macro_fx else "unavailable"
 
-                    # Pass macro risk context to Claude
-                    macro  = get_macro_snapshot()
-                    macro_context = (
-                        f"10Y Yield: {macro.yield_10y:.2f}% ({macro.yield_signal}) | "
-                        f"Oil: ${macro.oil_price:.1f} ({macro.oil_signal}) | "
-                        f"Breadth: {macro.breadth_signal} | "
-                        f"Risk Score: {macro.risk_score}/100 — {macro.risk_level}"
-                    ) if macro else "unavailable"
-
-                    ai = analyse(
-                        ticker=ind["label"],
-                        current_price=ind["curr_p"],
-                        raw_signal=ind["signal"],
-                        rsi=ind["rsi"],
-                        vol_ratio=ind["vol_ratio"],
-                        macd_bullish=ind["macd_bullish"],
-                        trend_status=ind["trend_status"],
-                        delta_val=ind["delta_val"],
-                        sma200=ind["sma200_1h"],
-                        account_balance=risk_config.account_size_usd,
-                        lot_size=effective_lot,
-                        implied_volatility=iv_str,
-                        macro_context=macro_context,
-                    )
+                    effective_fx_lot = round(lot_size * _pair_regime.lot_multiplier, 2)
+                    if effective_fx_lot <= 0:
+                        st.error(f"🔴 {_pair_regime.icon} Regime blocks trading: {_pair_regime.strategy_note}")
+                        ai = None
+                    else:
+                        ai: FXSignal = analyse_pair(vp, effective_fx_lot, account_size, yield_context=yield_ctx)
 
                     if ai is None:
-                        st.warning("Claude analysis unavailable — check API key.")
+                        st.caption("🤖 Claude analysed this signal — conditions not fully met yet. Monitoring.")
                     else:
+                        cb_color = {"HAWKISH":"green","DOVISH":"red","NEUTRAL":"gray"}.get(ai.cb_sentiment,"gray")
+                        st.markdown(
+                            f"**CB Sentiment ({pair[:3]}):** :{cb_color}[{ai.cb_sentiment}] | "
+                            f"**Type:** {ai.signal_type.replace('_',' ')}"
+                        )
                         a_color = {"BUY":"green","SELL":"red","HOLD":"gray"}.get(ai.action,"gray")
                         st.markdown(
-                            f"**Decision:** :{a_color}[{ai.action}] "
-                            f"| Confidence: **{ai.confidence}**"
+                            f"**Decision:** :{a_color}[{ai.action}] | **Confidence:** {ai.confidence}"
                         )
                         st.caption(f"📊 {ai.reasoning}")
-                        if ai.sentiment_summary:
-                            st.info(f"🗞️ {ai.sentiment_summary}")
+                        if ai.news_summary:
+                            st.info(f"🗞️ {ai.news_summary}")
 
                         if ai.action != "HOLD":
-                            c1, c2, c3 = st.columns(3)
-                            c1.metric("Entry",       f"${ai.entry_price:,.2f}")
-                            c2.metric("Stop Loss",   f"${ai.stop_loss:,.2f}",
-                                      delta=f"{((ai.stop_loss-ai.entry_price)/ai.entry_price*100):+.2f}%",
-                                      delta_color="off")
-                            c3.metric("Take Profit", f"${ai.take_profit:,.2f}",
-                                      delta=f"{((ai.take_profit-ai.entry_price)/ai.entry_price*100):+.2f}%",
-                                      delta_color="off")
-
-                            risk_usd   = abs(ai.entry_price - ai.stop_loss) * (ai.lot_size * 100)
-                            reward_usd = abs(ai.take_profit - ai.entry_price) * (ai.lot_size * 100)
-                            rr         = reward_usd / risk_usd if risk_usd > 0 else 0
+                            rr       = ai.target_pips / ai.stop_pips if ai.stop_pips > 0 else 0
+                            risk_usd = ai.stop_pips * lot_size * 10
+                            st.write({
+                                "Level": ["Entry", "Stop Loss", "Take Profit"],
+                                "Price": [f"{ai.entry:.5f}", f"{ai.stop_loss:.5f}", f"{ai.take_profit:.5f}"],
+                                "Pips":  ["—", f"{ai.stop_pips:.1f}", f"{ai.target_pips:.1f}"],
+                            })
                             st.caption(
-                                f"Lot: {ai.lot_size} | Risk: ~${risk_usd:.2f} | "
-                                f"Reward: ~${reward_usd:.2f} | R:R = {rr:.1f}:1"
+                                f"R:R = {rr:.1f}:1 | Risk ~${risk_usd:.2f} | "
+                                f"Spread: {vp.spread_pips} pips"
                             )
 
                             if trade_allowed:
                                 if st.button(
-                                    f"⚡ Execute {ai.action} {ind['label']}",
-                                    key=f"exec_{ind['label']}",
+                                    f"⚡ Execute {ai.action} {pair}",
+                                    key=f"fx_exec_{pair}",
                                     type="primary",
                                 ):
-                                    from broker import place_order
-                                    result = place_order(
-                                        ticker=ind["label"],
-                                        action=ai.action,
-                                        stop_loss=ai.stop_loss,
-                                        take_profit=ai.take_profit,
-                                        lot_size=ai.lot_size,
-                                    )
-                                    if result.success:
-                                        record_trade_opened(
-                                            ticker=ind["label"],
+                                    try:
+                                        from broker import place_order
+                                        result = place_order(
+                                            ticker=pair,
                                             action=ai.action,
-                                            entry=result.filled_price or ai.entry_price,
-                                            sl=ai.stop_loss,
-                                            tp=ai.take_profit,
-                                            lots=ai.lot_size,
+                                            stop_loss=ai.stop_loss,
+                                            take_profit=ai.take_profit,
+                                            lot_size=lot_size,
                                         )
-                                        st.success(result.message)
-                                    else:
-                                        st.error(result.message)
+                                        if result.success:
+                                            st.session_state.fx_open_pair     = pair
+                                            st.session_state.fx_trades_today += 1
+                                            st.session_state.fx_trade_log.append({
+                                                "time":   pd.Timestamp.now().strftime("%H:%M"),
+                                                "pair":   pair,
+                                                "action": ai.action,
+                                                "entry":  ai.entry,
+                                                "sl":     ai.stop_loss,
+                                                "tp":     ai.take_profit,
+                                            })
+                                            st.success(result.message)
+                                        else:
+                                            st.error(result.message)
+                                    except ImportError:
+                                        st.success(
+                                            f"✅ [DEMO] {ai.action} {pair} @ {ai.entry:.5f} | "
+                                            f"SL {ai.stop_loss:.5f} | TP {ai.take_profit:.5f}"
+                                        )
                             else:
-                                st.error(trade_reason)
+                                st.error(block_reason)
+        else:
+            st.caption("📍 Price inside Value Area — no trade setup. Monitor for VA edge approach.")
 
         st.divider()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN RENDER
-# ══════════════════════════════════════════════════════════════════════════════
-
-render_heatmap()
-render_macro_panel()
-
-# Regime panel
-render_regime_panel(_global_regime, "Market Regime Detector")
-
-# NAS100
-st.subheader("📈 Nasdaq 100 Cash CFD (NAS100)")
-nas_col, _, _, _ = st.columns(4)
-try:
-    nas_ind = compute_indicators(NAS100_LABEL)
-    if nas_ind:
-        render_ticker_card(nas_ind, nas_col, risk_config)
-    else:
-        with nas_col:
-            st.warning("NAS100 data unavailable")
-except Exception as e:
-    with nas_col:
-        st.error(f"NAS100 error: {e}")
-
-# ── NAS100 SCALPING PANEL ────────────────────────────────────────────────────
-st.subheader("🎯 NAS100 Sniper Scalping")
-_nas_5m = get_5m(NAS100_LABEL)
-_nas_1d = get_1d(NAS100_LABEL)
-
-if _nas_5m is not None and nas_ind:
-    _nas_price = nas_ind['curr_p']
-    _nas_scalp = analyse_nas100_scalp(_nas_5m, _nas_1d, _nas_price)
-
-    sc1, sc2, sc3, sc4 = st.columns(4)
-
-    # VWAP
-    with sc1:
-        st.markdown("**📊 VWAP**")
-        if _nas_scalp.vwap:
-            vwap_color = "green" if _nas_price > _nas_scalp.vwap else "red"
-            st.markdown(
-                f"<span style='font-size:1.2em;color:{'#2d9e2d' if _nas_price > _nas_scalp.vwap else '#c9302c'}'>"
-                f"{_nas_scalp.vwap:,.0f}</span>",
-                unsafe_allow_html=True
-            )
-            st.caption(f"Dev: {_nas_scalp.vwap_deviation_pct:+.2f}%")
-            if _nas_scalp.vwap_setup:
-                vs = _nas_scalp.vwap_setup
-                st.warning(f"⚡ VWAP {vs.direction} setup — {vs.description[:60]}...")
-        else:
-            st.caption("VWAP unavailable (pre-market)")
-
-    # Gap Fill
-    with sc2:
-        st.markdown("**📐 Gap Fill**")
-        if _nas_scalp.gap_fill_setup:
-            gs = _nas_scalp.gap_fill_setup
-            d_col = "#2d9e2d" if gs.direction == "BUY" else "#c9302c"
-            st.markdown(
-                f"<span style='color:{d_col};font-weight:bold'>{gs.direction}</span> "
-                f"→ {gs.target:,.0f}",
-                unsafe_allow_html=True
-            )
-            st.caption(gs.description[:80])
-        else:
-            st.caption("No gap today")
-
-    # Key Levels
-    with sc3:
-        st.markdown("**🔑 Key Levels**")
-        if _nas_scalp.key_levels:
-            nearest_levels = sorted(
-                _nas_scalp.key_levels,
-                key=lambda l: abs(l - _nas_price)
-            )[:3]
-            for lv in nearest_levels:
-                dist = lv - _nas_price
-                color = "#2d9e2d" if dist > 0 else "#c9302c"
-                st.markdown(
-                    f"<span style='color:{color}'>{lv:,.0f} ({dist:+.0f})</span>",
-                    unsafe_allow_html=True
-                )
-        if _nas_scalp.key_level_setup:
-            kls = _nas_scalp.key_level_setup
-            st.warning(f"⚡ AT KEY LEVEL — {kls.direction} bounce setup")
-
-    # Open Drive
-    with sc4:
-        st.markdown("**🚀 Open Drive**")
-        drive_colors = {
-            "BULLISH":  "#2d9e2d", "BEARISH": "#c9302c",
-            "CHOPPY":   "#e6a817", "PRE-OPEN": "#888",
-            "AWAITING": "#888",    "UNKNOWN":  "#888",
-        }
-        drive = _nas_scalp.open_drive or "UNKNOWN"
-        color = drive_colors.get(drive, "#888")
-        st.markdown(
-            f"<span style='font-size:1.3em;font-weight:bold;color:{color}'>"
-            f"{drive}</span>",
-            unsafe_allow_html=True
-        )
-        st.caption("First 15min NY direction bias")
-
-st.divider()
-
-# Mag 7
-st.subheader("🛡️ Magnificent 7 Stocks")
-cols = st.columns(4)
-for i, ticker in enumerate(MAG7):
-    try:
-        ind = compute_indicators(ticker)
-        if ind:
-            render_ticker_card(ind, cols[i % 4], risk_config)
-    except Exception as e:
-        with cols[i % 4]:
-            st.error(f"Error {ticker}: {e}")
