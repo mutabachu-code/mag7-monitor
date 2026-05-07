@@ -92,11 +92,17 @@ def _load(key):
 
 def _fetch_pair(pair: str) -> Tuple[Optional[pd.DataFrame],
                                      Optional[pd.DataFrame],
+                                     Optional[pd.DataFrame],
                                      Optional[pd.DataFrame]]:
     sym = YF_MAP[pair]
 
     def get_1h():
         df = yf.Ticker(sym).history(period="30d", interval="1h").ffill().bfill()
+        return df if not df.empty else None
+
+    def get_15m():
+        # 15m data for scalping — Order Blocks, FVG, Liquidity Sweeps
+        df = yf.Ticker(sym).history(period="5d", interval="15m").ffill().bfill()
         return df if not df.empty else None
 
     def get_4h():
@@ -116,10 +122,11 @@ def _fetch_pair(pair: str) -> Tuple[Optional[pd.DataFrame],
         return df if not df.empty else None
 
     # Run all three with individual timeouts
-    df_1h = _fetch_with_timeout(get_1h, FETCH_TIMEOUT)
-    df_4h = _fetch_with_timeout(get_4h, FETCH_TIMEOUT)
-    df_1d = _fetch_with_timeout(get_1d, FETCH_TIMEOUT)
-    return df_1h, df_4h, df_1d
+    df_15m = _fetch_with_timeout(get_15m, FETCH_TIMEOUT)
+    df_1h  = _fetch_with_timeout(get_1h, FETCH_TIMEOUT)
+    df_4h  = _fetch_with_timeout(get_4h, FETCH_TIMEOUT)
+    df_1d  = _fetch_with_timeout(get_1d, FETCH_TIMEOUT)
+    return df_15m, df_1h, df_4h, df_1d
 
 
 # ── MACRO FETCH (daily) ───────────────────────────────────────────────────────
@@ -161,7 +168,7 @@ def fetch_all_pairs() -> bool:
 
     # Forex pair threads
     def fetch_and_store(pair):
-        results[pair] = _fetch_pair(pair)
+        results[pair] = _fetch_pair(pair)   # returns (df_15m, df_1h, df_4h, df_1d)
 
     for pair in PAIRS:
         t = threading.Thread(target=fetch_and_store, args=(pair,), daemon=True)
@@ -183,12 +190,13 @@ def fetch_all_pairs() -> bool:
 
     # Store forex pair data
     any_ok = False
-    for pair, (df_1h, df_4h, df_1d) in results.items():
+    for pair, (df_15m, df_1h, df_4h, df_1d) in results.items():
         if df_1h is not None:
             any_ok = True
-        _store(f"fx_1h_{pair}", df_1h)
-        _store(f"fx_4h_{pair}", df_4h)
-        _store(f"fx_1d_{pair}", df_1d)
+        _store(f"fx_15m_{pair}", df_15m)
+        _store(f"fx_1h_{pair}",  df_1h)
+        _store(f"fx_4h_{pair}",  df_4h)
+        _store(f"fx_1d_{pair}",  df_1d)
 
     # Store macro data
     for key, df in macro_r.items():
@@ -201,6 +209,10 @@ def fetch_all_pairs() -> bool:
 
 
 # ── PUBLIC ACCESSORS — forex pairs ────────────────────────────────────────────
+
+def get_15m(pair: str) -> Optional[pd.DataFrame]:
+    """15-minute OHLCV — used for scalping (Order Blocks, FVG, Liquidity Sweeps)."""
+    return _load(f"fx_15m_{pair}")
 
 def get_1h(pair: str) -> Optional[pd.DataFrame]:
     return _load(f"fx_1h_{pair}")
