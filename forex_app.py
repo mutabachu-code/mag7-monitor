@@ -11,6 +11,7 @@ from forex_analyst import analyse_pair, FXSignal
 from macro_monitor import get_macro_snapshot
 from regime_detector import detect_regime_forex, render_regime_panel, render_regime_badge
 from scalping_engine import analyse_forex_scalp, ScalpSetup
+from cvd_calculator import calculate_cvd, render_cvd_badge, render_cvd_panel
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="FX Major Pairs Monitor", layout="wide", page_icon="💱")
@@ -314,6 +315,11 @@ for idx, pair in enumerate(PAIRS):
             gold_df=_fx_gold, jpy_df=_fx_jpy_df, tnx_df=_fx_tnx,
         )
         render_regime_badge(_pair_regime)
+
+        # CVD badge — order flow confirmation
+        _cvd_df  = get_15m(pair) if get_15m(pair) is not None else get_1h(pair)
+        _cvd     = calculate_cvd(_cvd_df, lookback=20)
+        render_cvd_badge(_cvd)
 
         # ── SCALPING SETUPS — always visible, uses 15m for precision ──────────
         _df_15m = get_15m(pair)
