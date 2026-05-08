@@ -333,6 +333,12 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
                         if iv else "unavailable"
                     )
 
+                    # Regime-adjusted lot size
+                    effective_lot = round(
+                        risk_config.lot_size * _global_regime.lot_multiplier, 2
+                    )
+                    effective_lot = max(effective_lot, 0.01)  # minimum 0.01
+
                     # Pass macro risk context to Claude
                     macro  = get_macro_snapshot()
                     macro_context = (
