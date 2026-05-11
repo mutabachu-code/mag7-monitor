@@ -194,6 +194,7 @@ def compute_indicators(label: str):
     if len(df_1h) < 200 or len(df_5m) < 20:
         return None
 
+    is_nas100    = (label == NAS100_LABEL)
     sma200_1h    = df_1h['Close'].rolling(window=200).mean().iloc[-1]
     curr_p       = df_5m['Close'].iloc[-1]
     prev_p       = df_5m['Close'].iloc[-2]
@@ -233,31 +234,61 @@ def compute_indicators(label: str):
     ann_vol     = df_5m['Close'].pct_change().std() * np.sqrt(252 * 78)
     delta_val   = get_bs_delta(curr_p, start_price, 1/252, 0.045, ann_vol)
 
-    # RSI momentum
-    rsi_prev   = rsi_series.iloc[-6] if len(rsi_series) >= 6 else rsi
-    rsi_rising = rsi > rsi_prev
-    rsi_falling= rsi < rsi_prev
-    price_mom  = (curr_p - df_5m['Close'].iloc[-13]) / df_5m['Close'].iloc[-13] * 100 if len(df_5m) >= 13 else 0
+    # RSI momentum direction
+    rsi_prev    = rsi_series.iloc[-6] if len(rsi_series) >= 6 else rsi
+    rsi_rising  = rsi > rsi_prev
+    rsi_falling = rsi < rsi_prev
 
-    # Signal logic
-    if curr_p > sma200_1h and rsi < 40 and vol_ratio > 1.1 and macd_bullish:
+    # Price momentum — use % change (works for both stocks and scaled NAS100)
+    if len(df_5m) >= 13:
+        price_13_ago = df_5m['Close'].iloc[-13]
+        # For NAS100 curr_p is already scaled, but df_5m is raw QQQ
+        # Compare QQQ raw prices for consistency, convert to %
+        price_mom = (df_5m['Close'].iloc[-1] - price_13_ago) / price_13_ago * 100
+    else:
+        price_mom = 0
+
+    # Signal logic — NAS100 gets relaxed thresholds (index volume ≠ stock volume)
+    vol_thresh_s = 1.05 if is_nas100 else 1.1    # NAS100: 5% surge enough
+    vol_thresh_m = 1.10 if is_nas100 else 1.3    # NAS100: 10% surge for momentum
+    mom_thresh   = 0.10 if is_nas100 else 0.30   # NAS100: 0.1% move meaningful
+
+    # STRONG BUY — oversold dip in uptrend
+    if curr_p > sma200_1h and rsi < 40 and vol_ratio > vol_thresh_s and macd_bullish:
         signal    = "🟢 STRONG BUY — Dip (Full Confluence)"
         sig_color = "green"
-    elif (curr_p > sma200_1h and rsi > 60 and rsi < 80
-          and rsi_rising and vol_ratio > 1.3 and macd_bullish and price_mom > 0.3):
+    # MOMENTUM BUY — trending surge
+    elif (curr_p > sma200_1h and rsi > 55 and rsi < 82
+          and rsi_rising and vol_ratio > vol_thresh_m
+          and macd_bullish and price_mom > mom_thresh):
         signal    = "🚀 MOMENTUM BUY — Breakout"
         sig_color = "green"
-    elif curr_p < sma200_1h and rsi > 60 and vol_ratio > 1.1 and not macd_bullish:
+    # TREND BUY (NAS100 only) — catches sustained rallies that miss strict thresholds
+    elif (is_nas100 and curr_p > sma200_1h and macd_bullish
+          and 45 < rsi < 75 and rsi_rising and price_mom > 0.05):
+        signal    = "📈 TREND BUY — NAS100 Momentum"
+        sig_color = "green"
+    # STRONG SELL — overbought in downtrend
+    elif curr_p < sma200_1h and rsi > 60 and vol_ratio > vol_thresh_s and not macd_bullish:
         signal    = "🔴 STRONG SELL (Full Confluence)"
         sig_color = "red"
+    # MOMENTUM SELL
     elif (curr_p < sma200_1h and rsi < 40 and rsi > 20
-          and rsi_falling and vol_ratio > 1.3 and not macd_bullish and price_mom < -0.3):
+          and rsi_falling and vol_ratio > vol_thresh_m
+          and not macd_bullish and price_mom < -mom_thresh):
         signal    = "💥 MOMENTUM SELL — Breakdown"
         sig_color = "red"
+    # TREND SELL (NAS100 only)
+    elif (is_nas100 and curr_p < sma200_1h and not macd_bullish
+          and 25 < rsi < 55 and rsi_falling and price_mom < -0.05):
+        signal    = "📉 TREND SELL — NAS100 Momentum"
+        sig_color = "red"
+    # CAUTION BUY
     elif curr_p > sma200_1h and rsi < 35:
         signal    = "🟡 Caution Buy (No MACD Confirm)"
         sig_color = "orange"
-    elif curr_p > sma200_1h and rsi > 75 and vol_ratio < 0.8:
+    # OVERBOUGHT WARNING
+    elif curr_p > sma200_1h and rsi > 78 and vol_ratio < 0.8:
         signal    = "⚠️ Overbought — Watch for Reversal"
         sig_color = "orange"
     else:
