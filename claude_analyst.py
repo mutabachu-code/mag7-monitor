@@ -103,6 +103,8 @@ Take Profit Rule   : Minimum 2:1 reward-to-risk
 
 === YOUR TASK ===
 STEP 1 — Confirm technicals are valid for a trade.
+Note: If signal contains "TREND BUY" or "TREND SELL", this is a NAS100 index momentum
+signal with relaxed thresholds — treat it as a valid directional signal, not a caution.
 STEP 2 — Use your knowledge of {ticker} recent performance, analyst views, and macro context.
 STEP 3 — Factor in Macro Risk Context:
 - If YIELD TRAP warning: avoid new BUY entries on tech stocks (yields choking growth)
