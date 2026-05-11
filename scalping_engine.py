@@ -480,45 +480,92 @@ def _detect_vwap_setup_scaled(df_5m: pd.DataFrame, vwap_nas: float,
         if len(df) < 10:
             return None
 
-        typical  = (df['High'] + df['Low'] + df['Close']) / 3
-        std_qqq  = typical.std()
-        std_nas  = std_qqq * ratio          # scale std to NAS100 points
+        # Calculate std from SCALED NAS100 prices (not QQQ prices * ratio)
+        # Use the deviation of typical price from VWAP in NAS100 points
+        typical_qqq = (df['High'] + df['Low'] + df['Close']) / 3
+        # Scale typical prices to NAS100
+        typical_nas = typical_qqq * ratio
+        # Std of NAS100-scaled prices around VWAP
+        std_nas = float((typical_nas - vwap_nas).std())
+        # Minimum std floor: at least 50 NAS100 pts (prevents over-sensitivity)
+        std_nas = max(std_nas, 50.0)
 
         upper_2  = vwap_nas + 2 * std_nas
         lower_2  = vwap_nas - 2 * std_nas
         dev_pct  = (current_price - vwap_nas) / vwap_nas * 100
 
-        if current_price > upper_2:
+        # Only fire if TRULY extended (>0.4% from VWAP) AND outside 2σ
+        # This prevents false SELL signals during normal momentum rallies
+        if current_price > upper_2 and dev_pct > 0.4:
             return ScalpSetup(
                 pair="NAS100", setup_type="VWAP_DEV", direction="SELL",
-                entry_zone_high=current_price + 15,
-                entry_zone_low=current_price - 15,
+                entry_zone_high=current_price + 20,
+                entry_zone_low=current_price - 20,
                 target=vwap_nas,
-                invalidation=upper_2 + std_nas,
-                strength="STRONG" if dev_pct > 0.5 else "MEDIUM",
+                invalidation=upper_2 + std_nas * 0.5,
+                strength="STRONG" if dev_pct > 0.7 else "MEDIUM",
                 description=(
                     f"NAS100 {dev_pct:+.2f}% above VWAP ({vwap_nas:,.0f}). "
-                    f"Extended above 2σ band ({upper_2:,.0f}). "
-                    f"Target VWAP snap-back to {vwap_nas:,.0f}."
+                    f"Extended above 2σ ({upper_2:,.0f}). "
+                    f"Mean-reversion SELL — target VWAP {vwap_nas:,.0f}."
                 ),
                 pips_to_target=round(current_price - vwap_nas, 0),
-                risk_pips=round(std_nas, 0),
+                risk_pips=round(std_nas * 0.5, 0),
             )
-        elif current_price < lower_2:
+        elif current_price < lower_2 and dev_pct < -0.4:
+            return ScalpSetup(
+                pair="NAS100", setup_type="VWAP_DEV", direction="BUY",
+                entry_zone_high=current_price + 20,
+                entry_zone_low=current_price - 20,
+                target=vwap_nas,
+                invalidation=lower_2 - std_nas * 0.5,
+                strength="STRONG" if abs(dev_pct) > 0.7 else "MEDIUM",
+                description=(
+                    f"NAS100 {dev_pct:+.2f}% below VWAP ({vwap_nas:,.0f}). "
+                    f"Extended below 2σ ({lower_2:,.0f}). "
+                    f"Mean-reversion BUY — target VWAP {vwap_nas:,.0f}."
+                ),
+                pips_to_target=round(vwap_nas - current_price, 0),
+                risk_pips=round(std_nas * 0.5, 0),
+            )
+        # ── VWAP MOMENTUM: price above VWAP = bullish bias ──────────────
+        # Not extended enough for mean-reversion, but VWAP confirms direction
+        one_std_up   = vwap_nas + std_nas
+        one_std_down = vwap_nas - std_nas
+
+        if vwap_nas < current_price <= upper_2:
+            # Price above VWAP but not overextended = momentum BUY zone
             return ScalpSetup(
                 pair="NAS100", setup_type="VWAP_DEV", direction="BUY",
                 entry_zone_high=current_price + 15,
+                entry_zone_low=max(vwap_nas, current_price - 30),
+                target=current_price + std_nas,
+                invalidation=vwap_nas - 20,
+                strength="MEDIUM",
+                description=(
+                    f"NAS100 {dev_pct:+.2f}% above VWAP ({vwap_nas:,.0f}). "
+                    f"Bullish VWAP momentum — price holding above institutional fair value. "
+                    f"Target: {current_price + std_nas:,.0f}. Invalidation: below VWAP."
+                ),
+                pips_to_target=round(std_nas, 0),
+                risk_pips=round(current_price - vwap_nas + 20, 0),
+            )
+        elif lower_2 <= current_price < vwap_nas:
+            # Price below VWAP but not deeply — bearish bias
+            return ScalpSetup(
+                pair="NAS100", setup_type="VWAP_DEV", direction="SELL",
+                entry_zone_high=min(vwap_nas, current_price + 30),
                 entry_zone_low=current_price - 15,
-                target=vwap_nas,
-                invalidation=lower_2 - std_nas,
-                strength="STRONG" if abs(dev_pct) > 0.5 else "MEDIUM",
+                target=current_price - std_nas,
+                invalidation=vwap_nas + 20,
+                strength="MEDIUM",
                 description=(
                     f"NAS100 {dev_pct:+.2f}% below VWAP ({vwap_nas:,.0f}). "
-                    f"Extended below 2σ band ({lower_2:,.0f}). "
-                    f"Target VWAP snap-back to {vwap_nas:,.0f}."
+                    f"Bearish VWAP momentum — price failing to reclaim institutional fair value. "
+                    f"Target: {current_price - std_nas:,.0f}. Invalidation: above VWAP."
                 ),
-                pips_to_target=round(vwap_nas - current_price, 0),
-                risk_pips=round(std_nas, 0),
+                pips_to_target=round(std_nas, 0),
+                risk_pips=round(vwap_nas - current_price + 20, 0),
             )
         return None
     except Exception as e:
