@@ -41,6 +41,8 @@ class VolumeProfile:
     rsi_1h: float
     day_pct: float          # % change today
     spread_pips: float      # estimated spread
+    inst_move: bool = False         # institutional candle detected
+    inst_direction: str = "NONE"    # BUY | SELL | NONE
 
 
 def _calc_atr(df: pd.DataFrame, period: int = 14) -> float:
