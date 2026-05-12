@@ -316,10 +316,22 @@ for idx, pair in enumerate(PAIRS):
         )
         render_regime_badge(_pair_regime)
 
-        # CVD badge — order flow confirmation
+        # CVD + Institutional move detection
         _cvd_df  = get_15m(pair) if get_15m(pair) is not None else get_1h(pair)
         _cvd     = calculate_cvd(_cvd_df, lookback=20)
         render_cvd_badge(_cvd)
+
+        # Institutional move alert
+        if vp.inst_move and vp.inst_direction != "NONE":
+            _inst_col = "#2d9e2d" if vp.inst_direction == "BUY" else "#c9302c"
+            st.markdown(
+                f"<div style='padding:3px 8px;border-radius:4px;"
+                f"background:{_inst_col}22;border:1px solid {_inst_col};"
+                f"font-size:0.82em;margin:2px 0'>"
+                f"<b style='color:{_inst_col}'>🏦 INSTITUTIONAL {vp.inst_direction} "
+                f"detected — large candle (1.5x ATR)</b></div>",
+                unsafe_allow_html=True
+            )
 
         # ── SCALPING SETUPS — always visible, uses 15m for precision ──────────
         _df_15m = get_15m(pair)
