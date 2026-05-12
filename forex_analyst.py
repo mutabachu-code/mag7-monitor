@@ -80,6 +80,7 @@ ATR               : {vp.atr:.5f} ({vp.atr_pct*100:.3f}%)
 
 === ACCOUNT ===
 Balance: ${account_balance:.2f} | Lot: {lot_size} | Spread: {vp.spread_pips} pips
+Institutional Move: {"YES — " + vp.inst_direction + " block detected on 1H" if vp.inst_move else "None detected"}
 
 === MACRO CONTEXT ===
 {yield_context}
