@@ -13,6 +13,13 @@ from iv_calculator import get_iv_data
 from claude_analyst import analyse
 from risk_manager import RiskConfig, init_risk_state, render_risk_sidebar, check_trade_allowed, record_trade_opened
 
+# ── NEW ENGINES ───────────────────────────────────────────────────────────────
+from options_intelligence import (
+    get_oi_heatmap, get_gex, get_expected_move,
+    render_oi_heatmap, render_gex_panel, render_expected_move_panel,
+)
+from breadth_quality import get_breadth_quality, render_breadth_quality_panel
+
 # ── SETUP ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Mag 7 + NAS100 Monitor", layout="wide")
 init_risk_state()
@@ -29,7 +36,7 @@ risk_config = render_risk_sidebar(risk_config)
 st.title("🛡️ Mag 7 + NAS100 MTF Monitor + Claude AI")
 st.caption(
     f"Last Update: {pd.Timestamp.now().strftime('%H:%M:%S')} | "
-    "5m Signals · 1H MACD · IV Analysis · Claude AI"
+    "5m Signals · 1H MACD · IV Analysis · Options Intelligence · Claude AI"
 )
 
 NAS100_LABEL = 'NAS100'
@@ -37,11 +44,6 @@ NAS100_LABEL = 'NAS100'
 
 # ── SESSION GATE ──────────────────────────────────────────────────────────────
 def _claude_allowed_stocks() -> tuple:
-    """
-    Gate Claude calls to NY market hours only.
-    Saves API costs outside trading hours.
-    Returns (allowed: bool, reason: str, prime_time: bool)
-    """
     utc   = datetime.now(timezone.utc)
     start = utc.replace(hour=14, minute=30, second=0, microsecond=0)
     end   = utc.replace(hour=21, minute=0,  second=0, microsecond=0)
@@ -90,7 +92,7 @@ elif fetch_elapsed > 15:
 
 vix_value = get_vix()
 
-# ── COMPUTE GLOBAL REGIME (shared across all ticker cards) ───────────────────
+# ── COMPUTE GLOBAL REGIME ─────────────────────────────────────────────────────
 _macro_snap  = get_macro_snapshot()
 _gold_df     = get_gold_df()
 _tnx_df      = get_macro_df("tnx")
@@ -107,7 +109,6 @@ _global_regime = detect_regime_stocks(
 def render_heatmap():
     st.subheader("📊 NAS100 + Mag 7 Hourly Heatmap")
 
-    # Market status
     utc      = datetime.now(timezone.utc)
     ny_hour  = (utc.hour - 4) % 24
     ny_wday  = utc.weekday()
@@ -199,7 +200,6 @@ def compute_indicators(label: str):
     curr_p       = df_5m['Close'].iloc[-1]
     prev_p       = df_5m['Close'].iloc[-2]
 
-    # Scale QQQ → NAS100 index price
     if label == NAS100_LABEL:
         ratio     = get_qqq_ndx_ratio()
         curr_p    = round(curr_p    * ratio, 0)
@@ -234,60 +234,47 @@ def compute_indicators(label: str):
     ann_vol     = df_5m['Close'].pct_change().std() * np.sqrt(252 * 78)
     delta_val   = get_bs_delta(curr_p, start_price, 1/252, 0.045, ann_vol)
 
-    # RSI momentum direction
     rsi_prev    = rsi_series.iloc[-6] if len(rsi_series) >= 6 else rsi
     rsi_rising  = rsi > rsi_prev
     rsi_falling = rsi < rsi_prev
 
-    # Price momentum — use % change (works for both stocks and scaled NAS100)
     if len(df_5m) >= 13:
         price_13_ago = df_5m['Close'].iloc[-13]
-        # For NAS100 curr_p is already scaled, but df_5m is raw QQQ
-        # Compare QQQ raw prices for consistency, convert to %
         price_mom = (df_5m['Close'].iloc[-1] - price_13_ago) / price_13_ago * 100
     else:
         price_mom = 0
 
-    # Signal logic — NAS100 gets relaxed thresholds (index volume ≠ stock volume)
-    vol_thresh_s = 1.05 if is_nas100 else 1.1    # NAS100: 5% surge enough
-    vol_thresh_m = 1.10 if is_nas100 else 1.3    # NAS100: 10% surge for momentum
-    mom_thresh   = 0.10 if is_nas100 else 0.30   # NAS100: 0.1% move meaningful
+    vol_thresh_s = 1.05 if is_nas100 else 1.1
+    vol_thresh_m = 1.10 if is_nas100 else 1.3
+    mom_thresh   = 0.10 if is_nas100 else 0.30
 
-    # STRONG BUY — oversold dip in uptrend
     if curr_p > sma200_1h and rsi < 40 and vol_ratio > vol_thresh_s and macd_bullish:
         signal    = "🟢 STRONG BUY — Dip (Full Confluence)"
         sig_color = "green"
-    # MOMENTUM BUY — trending surge
     elif (curr_p > sma200_1h and rsi > 55 and rsi < 82
           and rsi_rising and vol_ratio > vol_thresh_m
           and macd_bullish and price_mom > mom_thresh):
         signal    = "🚀 MOMENTUM BUY — Breakout"
         sig_color = "green"
-    # TREND BUY (NAS100 only) — catches sustained rallies that miss strict thresholds
     elif (is_nas100 and curr_p > sma200_1h and macd_bullish
           and 45 < rsi < 75 and rsi_rising and price_mom > 0.05):
         signal    = "📈 TREND BUY — NAS100 Momentum"
         sig_color = "green"
-    # STRONG SELL — overbought in downtrend
     elif curr_p < sma200_1h and rsi > 60 and vol_ratio > vol_thresh_s and not macd_bullish:
         signal    = "🔴 STRONG SELL (Full Confluence)"
         sig_color = "red"
-    # MOMENTUM SELL
     elif (curr_p < sma200_1h and rsi < 40 and rsi > 20
           and rsi_falling and vol_ratio > vol_thresh_m
           and not macd_bullish and price_mom < -mom_thresh):
         signal    = "💥 MOMENTUM SELL — Breakdown"
         sig_color = "red"
-    # TREND SELL (NAS100 only)
     elif (is_nas100 and curr_p < sma200_1h and not macd_bullish
           and 25 < rsi < 55 and rsi_falling and price_mom < -0.05):
         signal    = "📉 TREND SELL — NAS100 Momentum"
         sig_color = "red"
-    # CAUTION BUY
     elif curr_p > sma200_1h and rsi < 35:
         signal    = "🟡 Caution Buy (No MACD Confirm)"
         sig_color = "orange"
-    # OVERBOUGHT WARNING
     elif curr_p > sma200_1h and rsi > 78 and vol_ratio < 0.8:
         signal    = "⚠️ Overbought — Watch for Reversal"
         sig_color = "orange"
@@ -341,10 +328,8 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
         if ind["signal"] != "⚪ Neutral":
             with st.expander("🤖 Claude AI Analysis", expanded=True):
 
-                # ── SESSION GATE ──────────────────────────────────────────────
                 session_ok, session_msg, prime_time = _claude_allowed_stocks()
 
-                # Mid-session: only fire on STRONG/MOMENTUM signals
                 if session_ok and not prime_time:
                     weak = any(w in ind["signal"] for w in ["Caution", "Overbought"])
                     if weak:
@@ -364,13 +349,11 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
                         if iv else "unavailable"
                     )
 
-                    # Regime-adjusted lot size
                     effective_lot = round(
                         risk_config.lot_size * _global_regime.lot_multiplier, 2
                     )
-                    effective_lot = max(effective_lot, 0.01)  # minimum 0.01
+                    effective_lot = max(effective_lot, 0.01)
 
-                    # Pass macro risk context to Claude
                     macro  = get_macro_snapshot()
                     macro_context = (
                         f"10Y Yield: {macro.yield_10y:.2f}% ({macro.yield_signal}) | "
@@ -463,13 +446,16 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
 
 render_heatmap()
 render_macro_panel()
-
-# Regime panel
 render_regime_panel(_global_regime, "Market Regime Detector")
 
-# NAS100
+# ── SMART BREADTH QUALITY ENGINE ──────────────────────────────────────────────
+_breadth_quality = get_breadth_quality()
+render_breadth_quality_panel(_breadth_quality)
+
+# ── NAS100 ────────────────────────────────────────────────────────────────────
 st.subheader("📈 Nasdaq 100 Cash CFD (NAS100)")
 nas_col, _, _, _ = st.columns(4)
+nas_ind = None
 try:
     nas_ind = compute_indicators(NAS100_LABEL)
     if nas_ind:
@@ -481,7 +467,56 @@ except Exception as e:
     with nas_col:
         st.error(f"NAS100 error: {e}")
 
-# ── NAS100 SCALPING PANEL ────────────────────────────────────────────────────
+# ── OPTIONS INTELLIGENCE PANEL (NAS100 only) ──────────────────────────────────
+if nas_ind:
+    st.subheader("🧮 Options Intelligence — NAS100")
+    _nas_price = float(nas_ind['curr_p'])
+    _nas_ratio = float(get_qqq_ndx_ratio() or 40.0)
+
+    oi_col, gex_col, em_col = st.columns(3)
+
+    # OI Heatmap
+    with oi_col:
+        try:
+            _heatmap = get_oi_heatmap(_nas_price, _nas_ratio)
+            if _heatmap:
+                render_oi_heatmap(_heatmap)
+            else:
+                st.caption("OI heatmap unavailable (market closed or data error)")
+        except Exception as _e:
+            st.caption(f"OI heatmap error: {_e}")
+
+    # GEX
+    with gex_col:
+        try:
+            _gex = get_gex(_nas_price, _nas_ratio)
+            if _gex:
+                render_gex_panel(_gex)
+            else:
+                st.caption("GEX unavailable")
+        except Exception as _e:
+            st.caption(f"GEX error: {_e}")
+
+    # Expected Move
+    with em_col:
+        try:
+            _nas_5m_raw = get_5m(NAS100_LABEL)
+            _open_price_nas = (
+                float(_nas_5m_raw['Open'].iloc[0]) * _nas_ratio
+                if _nas_5m_raw is not None and len(_nas_5m_raw) > 0
+                else _nas_price
+            )
+            _em = get_expected_move(_nas_price, _open_price_nas, _nas_ratio)
+            if _em:
+                render_expected_move_panel(_em)
+            else:
+                st.caption("Expected move unavailable")
+        except Exception as _e:
+            st.caption(f"Expected move error: {_e}")
+
+    st.divider()
+
+# ── NAS100 SCALPING PANEL ─────────────────────────────────────────────────────
 st.subheader("🎯 NAS100 Sniper Scalping")
 _nas_5m = get_5m(NAS100_LABEL)
 _nas_1d = get_1d(NAS100_LABEL)
@@ -576,6 +611,33 @@ if _nas_5m is not None and nas_ind:
             elif drive == "CHOPPY":
                 st.warning("Avoid momentum — range scalp only")
 
+        # ── ENHANCED LIQUIDITY SWEEPS SUB-PANEL ──────────────────────────────
+        if _nas_scalp.liquidity_sweeps or _nas_scalp.active_fade_setup:
+            st.markdown("---")
+            st.markdown("**🎣 Liquidity Sweep Detector**")
+
+            if _nas_scalp.active_fade_setup:
+                fade = _nas_scalp.active_fade_setup
+                fade_color = "#2d9e2d" if fade.fade_direction == "BUY" else "#c9302c"
+                st.markdown(
+                    f"<div style='padding:8px;border-radius:6px;"
+                    f"background:{fade_color}22;border-left:3px solid {fade_color}'>"
+                    f"<span style='color:{fade_color};font-weight:bold'>"
+                    f"{'🟢' if fade.fade_direction == 'BUY' else '🔴'} "
+                    f"FADE {fade.fade_direction} — {fade.sweep_type.replace('_', ' ')}</span><br>"
+                    f"<span style='font-size:0.9em'>{fade.signal_text}</span><br>"
+                    f"<span style='color:#aaa;font-size:0.8em'>"
+                    f"Swept level: {fade.swept_level:,.0f} | "
+                    f"Sweep size: {fade.sweep_size_pts:.0f} pts | "
+                    f"RVOL: {fade.rvol_ratio:.1f}x"
+                    f"{'  ⚡ VOLUME CONFIRMED' if fade.rvol_spike else ''}"
+                    f"</span></div>",
+                    unsafe_allow_html=True
+                )
+            elif _nas_scalp.liquidity_sweeps:
+                for sw in _nas_scalp.liquidity_sweeps[:2]:
+                    st.caption(f"• {sw.signal_text[:120]}")
+
     except Exception as _se:
         st.warning(f"NAS100 scalping unavailable: {_se}")
 else:
@@ -583,7 +645,7 @@ else:
 
 st.divider()
 
-# Mag 7
+# ── MAG 7 ─────────────────────────────────────────────────────────────────────
 st.subheader("🛡️ Magnificent 7 Stocks")
 cols = st.columns(4)
 for i, ticker in enumerate(MAG7):
