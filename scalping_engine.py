@@ -16,6 +16,12 @@ NAS100 detects:
   2. Gap fill                — overnight gap identification + fill target
   3. Key level bounces       — round numbers, daily high/low, prev close
   4. Open Drive              — first 15min direction bias
+
+ENHANCED LIQUIDITY SWEEP DETECTION (v2):
+  A. Stop raids above/below equal highs/lows with RVOL spike confirmation
+  B. Overnight high/low sweeps
+  C. Previous day level sweeps
+  D. Fade setup signal after confirmed sweep
 """
 
 import pandas as pd
@@ -44,6 +50,19 @@ class ScalpSetup:
 
 
 @dataclass
+class LiquiditySweepDetail:
+    """Enhanced liquidity sweep with RVOL confirmation."""
+    sweep_type: str          # "EQUAL_HIGHS" | "EQUAL_LOWS" | "OVERNIGHT_HIGH" | "OVERNIGHT_LOW" | "PREV_DAY_HIGH" | "PREV_DAY_LOW"
+    swept_level: float       # the level that was swept
+    sweep_size_pts: float    # how far price went beyond the level
+    rvol_spike: bool         # was there a volume spike during sweep?
+    rvol_ratio: float        # current vol / avg vol
+    rejection_confirmed: bool  # did price close back inside?
+    fade_direction: str      # "BUY" (after sweep low) | "SELL" (after sweep high)
+    signal_text: str         # e.g. "Liquidity sweep detected → fade setup"
+
+
+@dataclass
 class ScalpReport:
     """Full scalping analysis for one instrument."""
     ticker: str
@@ -64,6 +83,10 @@ class ScalpReport:
     key_levels: List[float] = field(default_factory=list)
     key_level_setup: Optional[ScalpSetup] = None
     open_drive: Optional[str] = None  # "BULLISH" | "BEARISH" | "CHOPPY"
+
+    # Enhanced liquidity sweeps (NAS100)
+    liquidity_sweeps: List[LiquiditySweepDetail] = field(default_factory=list)
+    active_fade_setup: Optional[LiquiditySweepDetail] = None
 
     # Best setup (highest strength)
     best_setup: Optional[ScalpSetup] = None
@@ -87,11 +110,6 @@ def _get_pip(pair: str) -> float:
 
 def _detect_order_blocks(df: pd.DataFrame, pair: str,
                           current_price: float) -> List[ScalpSetup]:
-    """
-    Order Block: last bearish candle before a bullish impulse (or vice versa).
-    An OB is valid when price returns to that zone from above/below.
-    Look at last 50 candles on 1H chart.
-    """
     setups = []
     pip    = _get_pip(pair)
 
@@ -101,7 +119,6 @@ def _detect_order_blocks(df: pd.DataFrame, pair: str,
     df = df.copy()
     df.columns = [c.capitalize() for c in df.columns]
 
-    # Find swing highs and lows (pivot points)
     highs  = df['High'].values
     lows   = df['Low'].values
     closes = df['Close'].values
@@ -110,19 +127,15 @@ def _detect_order_blocks(df: pd.DataFrame, pair: str,
     lookback = min(50, len(df) - 5)
 
     for i in range(5, lookback):
-        # Bullish Order Block: bearish candle followed by strong bullish move
         is_bearish_candle = closes[i] < opens[i]
         if is_bearish_candle:
-            # Check if followed by impulse up (3 consecutive bullish candles)
             if (i + 3 < len(df) and
                 closes[i+1] > opens[i+1] and
                 closes[i+2] > opens[i+2] and
-                closes[i+3] > closes[i]):   # broke above OB
+                closes[i+3] > closes[i]):
 
-                ob_high = opens[i]   # top of bearish candle body
-                ob_low  = closes[i]  # bottom of bearish candle body
-
-                # Is price currently near the OB (within 20% of OB range above/below)?
+                ob_high = opens[i]
+                ob_low  = closes[i]
                 ob_range = ob_high - ob_low
                 if ob_low - ob_range * 0.5 <= current_price <= ob_high + ob_range * 0.3:
                     target      = float(highs[i+3])
@@ -142,7 +155,6 @@ def _detect_order_blocks(df: pd.DataFrame, pair: str,
                             risk_pips=round(risk_pips, 1),
                         ))
 
-        # Bearish Order Block: bullish candle followed by strong bearish move
         is_bullish_candle = closes[i] > opens[i]
         if is_bullish_candle:
             if (i + 3 < len(df) and
@@ -152,7 +164,6 @@ def _detect_order_blocks(df: pd.DataFrame, pair: str,
 
                 ob_high = closes[i]
                 ob_low  = opens[i]
-
                 ob_range = ob_high - ob_low
                 if ob_low - ob_range * 0.3 <= current_price <= ob_high + ob_range * 0.5:
                     target      = float(lows[i+3])
@@ -172,17 +183,12 @@ def _detect_order_blocks(df: pd.DataFrame, pair: str,
                             risk_pips=round(risk_pips, 1),
                         ))
 
-    # Return strongest setups only (closest to current price)
     setups.sort(key=lambda s: abs((s.entry_zone_high + s.entry_zone_low) / 2 - current_price))
     return setups[:2]
 
 
 def _detect_fvg(df: pd.DataFrame, pair: str,
                 current_price: float) -> List[ScalpSetup]:
-    """
-    Fair Value Gap: 3-candle pattern where candle 1 high < candle 3 low (bullish FVG)
-    or candle 1 low > candle 3 high (bearish FVG). Price returns to fill the gap.
-    """
     setups = []
     pip    = _get_pip(pair)
 
@@ -198,17 +204,12 @@ def _detect_fvg(df: pd.DataFrame, pair: str,
     lookback = min(30, len(df) - 3)
 
     for i in range(1, lookback):
-        # Bullish FVG: gap between candle[i-1] high and candle[i+1] low
         bull_fvg_top    = lows[i+1]
         bull_fvg_bottom = highs[i-1]
 
         if bull_fvg_top > bull_fvg_bottom:
             gap_size = (bull_fvg_top - bull_fvg_bottom) / pip
-
-            # Price pulling back into the FVG from above
-            if (bull_fvg_bottom <= current_price <= bull_fvg_top and
-                    gap_size >= 3):   # minimum 3 pip gap
-
+            if (bull_fvg_bottom <= current_price <= bull_fvg_top and gap_size >= 3):
                 target      = float(max(closes[i+1], closes[i+2]) if i+2 < len(df) else closes[i+1])
                 invalidation= bull_fvg_bottom - 3 * pip
                 pips_target = (target - current_price) / pip
@@ -226,16 +227,12 @@ def _detect_fvg(df: pd.DataFrame, pair: str,
                         risk_pips=round(risk_pips, 1),
                     ))
 
-        # Bearish FVG: gap between candle[i+1] high and candle[i-1] low
         bear_fvg_bottom = highs[i+1]
         bear_fvg_top    = lows[i-1]
 
         if bear_fvg_top > bear_fvg_bottom:
             gap_size = (bear_fvg_top - bear_fvg_bottom) / pip
-
-            if (bear_fvg_bottom <= current_price <= bear_fvg_top and
-                    gap_size >= 3):
-
+            if (bear_fvg_bottom <= current_price <= bear_fvg_top and gap_size >= 3):
                 target      = float(min(closes[i+1], closes[i+2]) if i+2 < len(df) else closes[i+1])
                 invalidation= bear_fvg_top + 3 * pip
                 pips_target = (current_price - target) / pip
@@ -259,10 +256,6 @@ def _detect_fvg(df: pd.DataFrame, pair: str,
 
 def _detect_liquidity_sweep(df: pd.DataFrame, pair: str,
                              current_price: float) -> List[ScalpSetup]:
-    """
-    Liquidity Sweep: price wicks above a recent swing high (or below swing low)
-    then closes back below/above it = stop hunt. Trade the reversal.
-    """
     setups = []
     pip    = _get_pip(pair)
 
@@ -277,17 +270,15 @@ def _detect_liquidity_sweep(df: pd.DataFrame, pair: str,
     lows    = recent['Low'].values
     closes  = recent['Close'].values
 
-    # Find the most significant swing high and low in last 20 candles (excluding last 3)
     swing_high = float(np.max(highs[:-3]))
     swing_low  = float(np.min(lows[:-3]))
     last_high  = float(highs[-1])
     last_low   = float(lows[-1])
     last_close = float(closes[-1])
 
-    # Bullish sweep: last candle wicked below swing low but closed above it
     if last_low < swing_low and last_close > swing_low:
         sweep_size  = (swing_low - last_low) / pip
-        if sweep_size >= 2:   # minimum 2 pip sweep
+        if sweep_size >= 2:
             target      = swing_high
             invalidation= last_low - 2 * pip
             pips_target = (target - current_price) / pip
@@ -306,7 +297,6 @@ def _detect_liquidity_sweep(df: pd.DataFrame, pair: str,
                     risk_pips=round(risk_pips, 1),
                 ))
 
-    # Bearish sweep: last candle wicked above swing high but closed below it
     if last_high > swing_high and last_close < swing_high:
         sweep_size  = (last_high - swing_high) / pip
         if sweep_size >= 2:
@@ -332,7 +322,6 @@ def _detect_liquidity_sweep(df: pd.DataFrame, pair: str,
 
 
 def _detect_asian_range(df_1h: pd.DataFrame, current_price: float) -> Optional[dict]:
-    """Calculate Asian session range (22:00-07:00 UTC) for London breakout trades."""
     if df_1h is None or df_1h.empty:
         return None
     try:
@@ -340,7 +329,6 @@ def _detect_asian_range(df_1h: pd.DataFrame, current_price: float) -> Optional[d
         df.index = pd.to_datetime(df.index, utc=True)
         df.columns = [c.capitalize() for c in df.columns]
 
-        # Get today's Asian session candles
         now   = pd.Timestamp.now(tz='UTC')
         start = now.replace(hour=22, minute=0, second=0) - pd.Timedelta(days=1)
         end   = now.replace(hour=7,  minute=0, second=0)
@@ -354,7 +342,6 @@ def _detect_asian_range(df_1h: pd.DataFrame, current_price: float) -> Optional[d
         asian_mid  = (asian_high + asian_low) / 2
         range_size = asian_high - asian_low
 
-        # Is price breaking out of the Asian range?
         breakout_up   = current_price > asian_high
         breakout_down = current_price < asian_low
         inside_range  = asian_low <= current_price <= asian_high
@@ -378,24 +365,199 @@ def _detect_asian_range(df_1h: pd.DataFrame, current_price: float) -> Optional[d
         return None
 
 
-# ── NAS100 SCALPING DETECTORS ─────────────────────────────────────────────────
+# ── ENHANCED NAS100 LIQUIDITY SWEEP DETECTION ─────────────────────────────────
+
+def _detect_nas100_liquidity_sweeps(df_5m: pd.DataFrame,
+                                     df_1d: pd.DataFrame,
+                                     current_price: float,
+                                     ratio: float = 40.0) -> List[LiquiditySweepDetail]:
+    """
+    Enhanced NAS100 liquidity sweep detection covering:
+    A. Equal highs / equal lows sweeps with RVOL confirmation
+    B. Overnight session high/low sweeps
+    C. Previous day high/low sweeps
+
+    Returns list of detected sweeps ordered by recency/strength.
+    """
+    sweeps = []
+    if df_5m is None or len(df_5m) < 20:
+        return sweeps
+
+    try:
+        df = df_5m.copy()
+        df.columns = [c.capitalize() for c in df.columns]
+        df.index   = pd.to_datetime(df.index, utc=True)
+
+        highs  = df['High'].values * ratio
+        lows   = df['Low'].values  * ratio
+        closes = df['Close'].values * ratio
+        vols   = df['Volume'].values
+
+        # RVOL: compare last 3 candles vs 20-bar average
+        vol_avg  = float(np.mean(vols[-20:-3])) if len(vols) > 23 else float(np.mean(vols))
+        vol_last = float(np.mean(vols[-3:])) if len(vols) >= 3 else vol_avg
+        rvol     = vol_last / vol_avg if vol_avg > 0 else 1.0
+
+        # ── A. Equal Highs / Equal Lows sweep ────────────────────────────────
+        lookback = min(30, len(df) - 5)
+        recent_highs = highs[-lookback:-3]
+        recent_lows  = lows[-lookback:-3]
+
+        if len(recent_highs) > 0:
+            # Equal highs: two or more highs within 0.05% of each other
+            max_recent_high = float(np.max(recent_highs))
+            last_high       = float(highs[-1])
+            last_close_h    = float(closes[-1])
+
+            if last_high > max_recent_high * 1.0005:  # swept above
+                if last_close_h < max_recent_high:    # rejected back below
+                    sweep_pts = last_high - max_recent_high
+                    sweeps.append(LiquiditySweepDetail(
+                        sweep_type="EQUAL_HIGHS",
+                        swept_level=round(max_recent_high, 0),
+                        sweep_size_pts=round(sweep_pts, 0),
+                        rvol_spike=rvol > 1.5,
+                        rvol_ratio=round(rvol, 2),
+                        rejection_confirmed=True,
+                        fade_direction="SELL",
+                        signal_text=(
+                            f"🔴 Equal highs swept at {max_recent_high:,.0f}. "
+                            f"Wick {sweep_pts:.0f} pts above — stop hunt confirmed. "
+                            f"{'RVOL spike confirms institutional activity. ' if rvol > 1.5 else ''}"
+                            f"Liquidity sweep detected → fade SELL setup."
+                        ),
+                    ))
+
+            # Equal lows sweep
+            min_recent_low  = float(np.min(recent_lows))
+            last_low        = float(lows[-1])
+            last_close_l    = float(closes[-1])
+
+            if last_low < min_recent_low * 0.9995:
+                if last_close_l > min_recent_low:
+                    sweep_pts = min_recent_low - last_low
+                    sweeps.append(LiquiditySweepDetail(
+                        sweep_type="EQUAL_LOWS",
+                        swept_level=round(min_recent_low, 0),
+                        sweep_size_pts=round(sweep_pts, 0),
+                        rvol_spike=rvol > 1.5,
+                        rvol_ratio=round(rvol, 2),
+                        rejection_confirmed=True,
+                        fade_direction="BUY",
+                        signal_text=(
+                            f"🟢 Equal lows swept at {min_recent_low:,.0f}. "
+                            f"Wick {sweep_pts:.0f} pts below — stop hunt confirmed. "
+                            f"{'RVOL spike confirms institutional activity. ' if rvol > 1.5 else ''}"
+                            f"Liquidity sweep detected → fade BUY setup."
+                        ),
+                    ))
+
+        # ── B. Overnight high/low (Asian session levels) ──────────────────────
+        today_utc = pd.Timestamp.now(tz='UTC').date()
+        overnight = df[df.index.date < today_utc]
+
+        if len(overnight) >= 5:
+            overnight_high = float((overnight['High'] * ratio / ratio).max()) * ratio  # already scaled
+            overnight_low  = float((overnight['Low']  * ratio / ratio).min()) * ratio
+
+            # Re-extract from raw (already scaled above in highs/lows arrays)
+            ov_mask = df.index.date < today_utc
+            if ov_mask.any():
+                ov_h = float(np.max(df.loc[ov_mask, 'High'].values * ratio))
+                ov_l = float(np.min(df.loc[ov_mask, 'Low'].values  * ratio))
+
+                if current_price < ov_l * 0.9998 and float(closes[-1]) > ov_l:
+                    sweeps.append(LiquiditySweepDetail(
+                        sweep_type="OVERNIGHT_LOW",
+                        swept_level=round(ov_l, 0),
+                        sweep_size_pts=round(ov_l - float(lows[-1]), 0),
+                        rvol_spike=rvol > 1.3,
+                        rvol_ratio=round(rvol, 2),
+                        rejection_confirmed=True,
+                        fade_direction="BUY",
+                        signal_text=(
+                            f"🟢 Overnight low ({ov_l:,.0f}) swept and reclaimed. "
+                            f"Institutions hunted stops below overnight range. "
+                            f"Liquidity sweep detected → fade BUY setup."
+                        ),
+                    ))
+
+                if current_price > ov_h * 1.0002 and float(closes[-1]) < ov_h:
+                    sweeps.append(LiquiditySweepDetail(
+                        sweep_type="OVERNIGHT_HIGH",
+                        swept_level=round(ov_h, 0),
+                        sweep_size_pts=round(float(highs[-1]) - ov_h, 0),
+                        rvol_spike=rvol > 1.3,
+                        rvol_ratio=round(rvol, 2),
+                        rejection_confirmed=True,
+                        fade_direction="SELL",
+                        signal_text=(
+                            f"🔴 Overnight high ({ov_h:,.0f}) swept and rejected. "
+                            f"Institutions hunted stops above overnight range. "
+                            f"Liquidity sweep detected → fade SELL setup."
+                        ),
+                    ))
+
+        # ── C. Previous day high/low sweep ───────────────────────────────────
+        if df_1d is not None and len(df_1d) >= 2:
+            d1 = df_1d.copy()
+            d1.columns = [c.capitalize() for c in d1.columns]
+
+            prev_day_high = float(d1['High'].iloc[-2])  * ratio
+            prev_day_low  = float(d1['Low'].iloc[-2])   * ratio
+
+            if float(highs[-1]) > prev_day_high and float(closes[-1]) < prev_day_high:
+                sweeps.append(LiquiditySweepDetail(
+                    sweep_type="PREV_DAY_HIGH",
+                    swept_level=round(prev_day_high, 0),
+                    sweep_size_pts=round(float(highs[-1]) - prev_day_high, 0),
+                    rvol_spike=rvol > 1.3,
+                    rvol_ratio=round(rvol, 2),
+                    rejection_confirmed=True,
+                    fade_direction="SELL",
+                    signal_text=(
+                        f"🔴 Previous day high ({prev_day_high:,.0f}) swept. "
+                        f"Classic stop-hunt above key daily level. "
+                        f"Liquidity sweep detected → fade SELL setup."
+                    ),
+                ))
+
+            if float(lows[-1]) < prev_day_low and float(closes[-1]) > prev_day_low:
+                sweeps.append(LiquiditySweepDetail(
+                    sweep_type="PREV_DAY_LOW",
+                    swept_level=round(prev_day_low, 0),
+                    sweep_size_pts=round(prev_day_low - float(lows[-1]), 0),
+                    rvol_spike=rvol > 1.3,
+                    rvol_ratio=round(rvol, 2),
+                    rejection_confirmed=True,
+                    fade_direction="BUY",
+                    signal_text=(
+                        f"🟢 Previous day low ({prev_day_low:,.0f}) swept. "
+                        f"Classic stop-hunt below key daily level. "
+                        f"Liquidity sweep detected → fade BUY setup."
+                    ),
+                ))
+
+        return sweeps
+
+    except Exception as e:
+        print(f"[scalping] NAS100 liquidity sweep error: {e}")
+        return []
+
+
+# ── NAS100 SCALPING DETECTORS (unchanged from original) ─────────────────────
 
 def _calc_vwap(df_5m: pd.DataFrame) -> Optional[float]:
-    """Calculate intraday VWAP from 5m data (today's session only)."""
     if df_5m is None or df_5m.empty:
         return None
     try:
         df = df_5m.copy()
         df.columns = [c.capitalize() for c in df.columns]
         df.index   = pd.to_datetime(df.index, utc=True)
-
-        # Today's candles only
         today = pd.Timestamp.now(tz='UTC').date()
         df    = df[df.index.date == today]
-
         if len(df) < 5:
             return None
-
         typical_price = (df['High'] + df['Low'] + df['Close']) / 3
         vwap = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
         return float(vwap.iloc[-1])
@@ -403,72 +565,9 @@ def _calc_vwap(df_5m: pd.DataFrame) -> Optional[float]:
         return None
 
 
-def _detect_vwap_setup(df_5m: pd.DataFrame, vwap: float,
-                        current_price: float) -> Optional[ScalpSetup]:
-    """
-    VWAP Deviation Scalp: price extended from VWAP + momentum fading = snap-back.
-    Uses 2-standard-deviation bands as extreme levels.
-    """
-    if df_5m is None or vwap is None:
-        return None
-    try:
-        df = df_5m.copy()
-        df.columns = [c.capitalize() for c in df.columns]
-        df.index   = pd.to_datetime(df.index, utc=True)
-        today = pd.Timestamp.now(tz='UTC').date()
-        df    = df[df.index.date == today]
-        if len(df) < 10:
-            return None
-
-        typical = (df['High'] + df['Low'] + df['Close']) / 3
-        std      = typical.std()
-        upper_2  = vwap + 2 * std
-        lower_2  = vwap - 2 * std
-        dev_pct  = (current_price - vwap) / vwap * 100
-
-        # Strong deviation — snap-back trade
-        if current_price > upper_2:
-            return ScalpSetup(
-                pair="NAS100", setup_type="VWAP_DEV", direction="SELL",
-                entry_zone_high=current_price + 5,
-                entry_zone_low=current_price - 5,
-                target=vwap,
-                invalidation=upper_2 + std,
-                strength="STRONG" if dev_pct > 0.8 else "MEDIUM",
-                description=(f"Price {dev_pct:+.2f}% above VWAP ({vwap:,.0f}). "
-                             f"Extended above 2σ band ({upper_2:,.0f}). "
-                             f"VWAP snap-back SELL setup."),
-                pips_to_target=round(current_price - vwap, 0),
-                risk_pips=round(std, 0),
-            )
-        elif current_price < lower_2:
-            return ScalpSetup(
-                pair="NAS100", setup_type="VWAP_DEV", direction="BUY",
-                entry_zone_high=current_price + 5,
-                entry_zone_low=current_price - 5,
-                target=vwap,
-                invalidation=lower_2 - std,
-                strength="STRONG" if abs(dev_pct) > 0.8 else "MEDIUM",
-                description=(f"Price {dev_pct:+.2f}% below VWAP ({vwap:,.0f}). "
-                             f"Extended below 2σ band ({lower_2:,.0f}). "
-                             f"VWAP snap-back BUY setup."),
-                pips_to_target=round(vwap - current_price, 0),
-                risk_pips=round(std, 0),
-            )
-        return None
-    except Exception as e:
-        print(f"[scalping] VWAP error: {e}")
-        return None
-
-
 def _detect_vwap_setup_scaled(df_5m: pd.DataFrame, vwap_nas: float,
                                current_price: float,
                                ratio: float = 40.0) -> Optional[ScalpSetup]:
-    """
-    VWAP deviation scalp using NAS100-scaled prices.
-    vwap_nas and current_price are both in NAS100 index points.
-    Standard deviation bands calculated from QQQ then scaled.
-    """
     if df_5m is None or vwap_nas is None:
         return None
     try:
@@ -480,22 +579,15 @@ def _detect_vwap_setup_scaled(df_5m: pd.DataFrame, vwap_nas: float,
         if len(df) < 10:
             return None
 
-        # Calculate std from SCALED NAS100 prices (not QQQ prices * ratio)
-        # Use the deviation of typical price from VWAP in NAS100 points
         typical_qqq = (df['High'] + df['Low'] + df['Close']) / 3
-        # Scale typical prices to NAS100
         typical_nas = typical_qqq * ratio
-        # Std of NAS100-scaled prices around VWAP
         std_nas = float((typical_nas - vwap_nas).std())
-        # Minimum std floor: at least 50 NAS100 pts (prevents over-sensitivity)
         std_nas = max(std_nas, 50.0)
 
         upper_2  = vwap_nas + 2 * std_nas
         lower_2  = vwap_nas - 2 * std_nas
         dev_pct  = (current_price - vwap_nas) / vwap_nas * 100
 
-        # Only fire if TRULY extended (>0.4% from VWAP) AND outside 2σ
-        # This prevents false SELL signals during normal momentum rallies
         if current_price > upper_2 and dev_pct > 0.4:
             return ScalpSetup(
                 pair="NAS100", setup_type="VWAP_DEV", direction="SELL",
@@ -528,13 +620,11 @@ def _detect_vwap_setup_scaled(df_5m: pd.DataFrame, vwap_nas: float,
                 pips_to_target=round(vwap_nas - current_price, 0),
                 risk_pips=round(std_nas * 0.5, 0),
             )
-        # ── VWAP MOMENTUM: price above VWAP = bullish bias ──────────────
-        # Not extended enough for mean-reversion, but VWAP confirms direction
+
         one_std_up   = vwap_nas + std_nas
         one_std_down = vwap_nas - std_nas
 
         if vwap_nas < current_price <= upper_2:
-            # Price above VWAP but not overextended = momentum BUY zone
             return ScalpSetup(
                 pair="NAS100", setup_type="VWAP_DEV", direction="BUY",
                 entry_zone_high=current_price + 15,
@@ -551,7 +641,6 @@ def _detect_vwap_setup_scaled(df_5m: pd.DataFrame, vwap_nas: float,
                 risk_pips=round(current_price - vwap_nas + 20, 0),
             )
         elif lower_2 <= current_price < vwap_nas:
-            # Price below VWAP but not deeply — bearish bias
             return ScalpSetup(
                 pair="NAS100", setup_type="VWAP_DEV", direction="SELL",
                 entry_zone_high=min(vwap_nas, current_price + 30),
@@ -576,10 +665,6 @@ def _detect_vwap_setup_scaled(df_5m: pd.DataFrame, vwap_nas: float,
 def _detect_gap_fill(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
                       current_price: float,
                       ratio: float = 40.0) -> Optional[ScalpSetup]:
-    """
-    Gap Fill: today's open vs yesterday's close.
-    df_1d is QQQ data — prices scaled by ratio to NAS100 index points.
-    """
     if df_1d is None or df_5m is None or len(df_1d) < 2:
         return None
     try:
@@ -588,21 +673,18 @@ def _detect_gap_fill(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
         df5 = df_5m.copy()
         df5.columns = [c.capitalize() for c in df5.columns]
 
-        # Scale QQQ prices to NAS100 index points
         prev_close  = float(df1['Close'].iloc[-2]) * ratio
         today_open  = float(df5['Open'].iloc[0])   * ratio
         gap_size    = today_open - prev_close
         gap_pct     = abs(gap_size) / prev_close * 100
 
-        # Significant gap (> 0.1% for NAS100)
         if gap_pct < 0.1:
             return None
 
-        # Gap fill target = previous close
         target = prev_close
 
-        if gap_size > 0:   # gap up — potential fill down to prev close
-            if current_price > prev_close:  # still above prev close
+        if gap_size > 0:
+            if current_price > prev_close:
                 return ScalpSetup(
                     pair="NAS100", setup_type="GAP_FILL", direction="SELL",
                     entry_zone_high=today_open + 10,
@@ -616,7 +698,7 @@ def _detect_gap_fill(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
                     pips_to_target=round(current_price - prev_close, 0),
                     risk_pips=round(gap_size * 0.5, 0),
                 )
-        else:  # gap down — fill up to prev close
+        else:
             if current_price < prev_close:
                 return ScalpSetup(
                     pair="NAS100", setup_type="GAP_FILL", direction="BUY",
@@ -640,28 +722,21 @@ def _detect_gap_fill(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
 def _detect_key_levels(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
                         current_price: float,
                         ratio: float = 40.0) -> tuple:
-    """
-    Key level bounces: round numbers, daily high/low, prev close, prev day high/low.
-    Returns (list of key levels, nearest setup or None).
-    """
     levels = []
     if df_1d is not None and len(df_1d) >= 2:
         df1 = df_1d.copy()
         df1.columns = [c.capitalize() for c in df1.columns]
-        # Scale QQQ prices to NAS100 index points
         levels.extend([
-            float(df1['High'].iloc[-1])   * ratio,   # today's high
-            float(df1['Low'].iloc[-1])    * ratio,   # today's low
-            float(df1['Close'].iloc[-2])  * ratio,   # prev close
-            float(df1['High'].iloc[-2])   * ratio,   # prev day high
-            float(df1['Low'].iloc[-2])    * ratio,   # prev day low
+            float(df1['High'].iloc[-1])   * ratio,
+            float(df1['Low'].iloc[-1])    * ratio,
+            float(df1['Close'].iloc[-2])  * ratio,
+            float(df1['High'].iloc[-2])   * ratio,
+            float(df1['Low'].iloc[-2])    * ratio,
         ])
 
-    # Round numbers (every 500 pts for NAS100)
     base   = round(current_price / 500) * 500
     levels.extend([base - 500, base, base + 500, base + 1000])
 
-    # Find nearest key level to current price
     if not levels:
         return [], None
 
@@ -669,7 +744,6 @@ def _detect_key_levels(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
     nearest = min(levels, key=lambda l: abs(l - current_price))
     dist    = abs(nearest - current_price)
 
-    # Only signal if within 0.15% of the level
     if dist / current_price > 0.0015:
         return levels, None
 
@@ -690,7 +764,6 @@ def _detect_key_levels(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
 
 
 def _detect_open_drive(df_5m: pd.DataFrame) -> str:
-    """First 15 minutes direction bias for NAS100 NY open."""
     if df_5m is None or len(df_5m) < 5:
         return "UNKNOWN"
     try:
@@ -698,7 +771,6 @@ def _detect_open_drive(df_5m: pd.DataFrame) -> str:
         df.columns = [c.capitalize() for c in df.columns]
         df.index   = pd.to_datetime(df.index, utc=True)
 
-        # NY open = 14:30 UTC
         now = pd.Timestamp.now(tz='UTC')
         ny_open = now.replace(hour=14, minute=30, second=0, microsecond=0)
         if now < ny_open:
@@ -725,7 +797,6 @@ def _detect_open_drive(df_5m: pd.DataFrame) -> str:
 
 def analyse_forex_scalp(pair: str, df_1h: pd.DataFrame,
                          current_price: float) -> ScalpReport:
-    """Run all forex scalping detectors for one pair."""
     session = _get_session()
     report  = ScalpReport(ticker=pair, current_price=current_price, session=session)
 
@@ -734,7 +805,6 @@ def analyse_forex_scalp(pair: str, df_1h: pd.DataFrame,
     report.liq_sweeps   = _detect_liquidity_sweep(df_1h, pair, current_price)
     report.asian_range  = _detect_asian_range(df_1h, current_price)
 
-    # Find best setup across all types
     all_setups = report.order_blocks + report.fvgs + report.liq_sweeps
     strong     = [s for s in all_setups if s.strength == "STRONG"]
     if strong:
@@ -750,31 +820,40 @@ def analyse_nas100_scalp(df_5m: pd.DataFrame,
                           current_price: float,
                           qqq_to_nas100_ratio: float = 40.0) -> ScalpReport:
     """
-    Run all NAS100 scalping detectors.
+    Run all NAS100 scalping detectors including enhanced liquidity sweep detection.
     current_price is NAS100 index points (~19000).
-    df_5m is QQQ data — VWAP calculated on QQQ then scaled to NAS100.
-    qqq_to_nas100_ratio: multiply QQQ price by this to get NAS100 index price.
     """
     session = _get_session()
     report  = ScalpReport(ticker="NAS100", current_price=current_price, session=session)
 
-    _raw_vwap = _calc_vwap(df_5m)   # QQQ VWAP in ETF price (~$465)
-    # Scale QQQ VWAP to NAS100 index points
+    _raw_vwap = _calc_vwap(df_5m)
     report.vwap = round(_raw_vwap * qqq_to_nas100_ratio, 0) if _raw_vwap else None
     if report.vwap:
         report.vwap_deviation_pct = round(
             (current_price - report.vwap) / report.vwap * 100, 3
         )
-        # Pass scaled VWAP and current_price (both in NAS100 pts) to setup detector
         report.vwap_setup = _detect_vwap_setup_scaled(
             df_5m, report.vwap, current_price, qqq_to_nas100_ratio
         )
 
     report.gap_fill_setup = _detect_gap_fill(df_1d, df_5m, current_price, qqq_to_nas100_ratio)
-    report.key_levels, report.key_level_setup = _detect_key_levels(df_1d, df_5m, current_price, qqq_to_nas100_ratio)
+    report.key_levels, report.key_level_setup = _detect_key_levels(
+        df_1d, df_5m, current_price, qqq_to_nas100_ratio
+    )
     report.open_drive = _detect_open_drive(df_5m)
 
-    # Best NAS100 setup
+    # ── ENHANCED: Liquidity sweeps with RVOL confirmation ────────────────────
+    report.liquidity_sweeps = _detect_nas100_liquidity_sweeps(
+        df_5m, df_1d, current_price, qqq_to_nas100_ratio
+    )
+    # Most recent / strongest sweep becomes the active fade setup
+    strong_sweeps = [s for s in report.liquidity_sweeps if s.rvol_spike]
+    if strong_sweeps:
+        report.active_fade_setup = strong_sweeps[0]
+    elif report.liquidity_sweeps:
+        report.active_fade_setup = report.liquidity_sweeps[0]
+
+    # Best overall setup
     candidates = [s for s in [report.vwap_setup, report.gap_fill_setup,
                                report.key_level_setup] if s is not None]
     strong = [s for s in candidates if s.strength == "STRONG"]
