@@ -19,6 +19,7 @@ from options_intelligence import (
     render_oi_heatmap, render_gex_panel, render_expected_move_panel,
 )
 from breadth_quality import get_breadth_quality, render_breadth_quality_panel
+from master_signal import compute_master_signal, render_master_signal
 
 # ── SETUP ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Mag 7 + NAS100 Monitor", layout="wide")
@@ -468,6 +469,52 @@ except Exception as e:
         st.error(f"NAS100 error: {e}")
 
 # ── OPTIONS INTELLIGENCE PANEL (NAS100 only) ──────────────────────────────────
+# ── MASTER SIGNAL ─────────────────────────────────────────────────────────────
+# Run scalping now (needed by master signal) even before the scalp panel renders
+_nas_5m_early = get_5m(NAS100_LABEL)
+_nas_1d_early = get_1d(NAS100_LABEL)
+_nas_ratio_ms = float(get_qqq_ndx_ratio() or 40.0)
+_scalp_for_ms = None
+if _nas_5m_early is not None and nas_ind:
+    try:
+        _scalp_for_ms = analyse_nas100_scalp(
+            _nas_5m_early,
+            _nas_1d_early if _nas_1d_early is not None else _nas_5m_early,
+            float(nas_ind['curr_p']),
+            qqq_to_nas100_ratio=_nas_ratio_ms,
+        )
+    except Exception:
+        pass
+
+_nas_price_ms = float(nas_ind['curr_p']) if nas_ind else None
+_gex_ms       = None
+_heatmap_ms   = None
+_em_ms        = None
+if _nas_price_ms:
+    try:
+        _gex_ms     = get_gex(_nas_price_ms, _nas_ratio_ms)
+        _heatmap_ms = get_oi_heatmap(_nas_price_ms, _nas_ratio_ms)
+        _open_ms    = (float(_nas_5m_early['Open'].iloc[0]) * _nas_ratio_ms
+                       if _nas_5m_early is not None and len(_nas_5m_early) > 0
+                       else _nas_price_ms)
+        _em_ms      = get_expected_move(_nas_price_ms, _open_ms, _nas_ratio_ms)
+    except Exception:
+        pass
+
+_master_sig = compute_master_signal(
+    ind=nas_ind,
+    macro_snap=_macro_snap,
+    regime=_global_regime,
+    gex=_gex_ms,
+    heatmap=_heatmap_ms,
+    expected_move=_em_ms,
+    breadth_quality=_breadth_quality,
+    scalp_report=_scalp_for_ms,
+)
+render_master_signal(_master_sig, risk_config)
+
+st.divider()
+
 if nas_ind:
     st.subheader("🧮 Options Intelligence — NAS100")
     _nas_price = float(nas_ind['curr_p'])
@@ -475,10 +522,10 @@ if nas_ind:
 
     oi_col, gex_col, em_col = st.columns(3)
 
-    # OI Heatmap
+    # OI Heatmap — reuse cached fetch from master signal
     with oi_col:
         try:
-            _heatmap = get_oi_heatmap(_nas_price, _nas_ratio)
+            _heatmap = _heatmap_ms or get_oi_heatmap(_nas_price, _nas_ratio)
             if _heatmap:
                 render_oi_heatmap(_heatmap)
             else:
@@ -486,10 +533,10 @@ if nas_ind:
         except Exception as _e:
             st.caption(f"OI heatmap error: {_e}")
 
-    # GEX
+    # GEX — reuse cached fetch
     with gex_col:
         try:
-            _gex = get_gex(_nas_price, _nas_ratio)
+            _gex = _gex_ms or get_gex(_nas_price, _nas_ratio)
             if _gex:
                 render_gex_panel(_gex)
             else:
@@ -497,16 +544,10 @@ if nas_ind:
         except Exception as _e:
             st.caption(f"GEX error: {_e}")
 
-    # Expected Move
+    # Expected Move — reuse cached fetch
     with em_col:
         try:
-            _nas_5m_raw = get_5m(NAS100_LABEL)
-            _open_price_nas = (
-                float(_nas_5m_raw['Open'].iloc[0]) * _nas_ratio
-                if _nas_5m_raw is not None and len(_nas_5m_raw) > 0
-                else _nas_price
-            )
-            _em = get_expected_move(_nas_price, _open_price_nas, _nas_ratio)
+            _em = _em_ms or get_expected_move(_nas_price, _nas_price, _nas_ratio)
             if _em:
                 render_expected_move_panel(_em)
             else:
@@ -525,7 +566,8 @@ if _nas_5m is not None and nas_ind:
     try:
         _nas_price = float(nas_ind['curr_p'])
         _nas_ratio = float(get_qqq_ndx_ratio() or 40.0)
-        _nas_scalp = analyse_nas100_scalp(
+        # Reuse scalp already computed for master signal (same refresh cycle)
+        _nas_scalp = _scalp_for_ms or analyse_nas100_scalp(
             _nas_5m,
             _nas_1d if _nas_1d is not None else _nas_5m,
             _nas_price,
