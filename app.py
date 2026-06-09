@@ -97,7 +97,63 @@ vix_value = get_vix()
 _macro_snap    = get_macro_snapshot()
 _gold_df       = get_gold_df()
 _tnx_df        = get_macro_df("tnx")
-_global_regime = None   # populated after nas_ind is computed below
+_global_regime = None   # populated below using cached 5m + macro data
+
+# ── COMPUTE GLOBAL REGIME (safe, at top, uses cached data) ───────────────────
+try:
+    _nas_5m_for_regime = get_5m(NAS100_LABEL)
+    _nas_1h_for_regime = get_1h(NAS100_LABEL)
+
+    # Extract live technicals from cached data — no new fetch needed
+    _r_trend_bullish = True
+    _r_macd_bullish  = True
+    _r_rsi           = 50.0
+    _r_price_vs_sma  = 1.0
+
+    if _nas_1h_for_regime is not None and len(_nas_1h_for_regime) >= 200:
+        _r_sma200 = float(_nas_1h_for_regime['Close'].rolling(200).mean().iloc[-1])
+        _r_price  = float(_nas_1h_for_regime['Close'].iloc[-1])
+        _r_trend_bullish = _r_price > _r_sma200
+        _r_price_vs_sma  = (_r_price - _r_sma200) / _r_sma200 * 100 if _r_sma200 > 0 else 1.0
+
+        _ema12 = _nas_1h_for_regime['Close'].ewm(span=12, adjust=False).mean()
+        _ema26 = _nas_1h_for_regime['Close'].ewm(span=26, adjust=False).mean()
+        _macd  = _ema12 - _ema26
+        _sig   = _macd.ewm(span=9, adjust=False).mean()
+        _r_macd_bullish = float(_macd.iloc[-1]) > float(_sig.iloc[-1])
+
+    if _nas_5m_for_regime is not None and len(_nas_5m_for_regime) >= 15:
+        _dp   = _nas_5m_for_regime['Close'].diff()
+        _gain = _dp.where(_dp > 0, 0).rolling(14).mean()
+        _loss = (-_dp.where(_dp < 0, 0)).rolling(14).mean()
+        _rs   = _gain / _loss.replace(0, 1e-10)
+        _r_rsi = float((100 - 100 / (1 + _rs)).iloc[-1])
+
+    _global_regime = detect_regime_stocks(
+        vix=vix_value,
+        df_5m=_nas_5m_for_regime,
+        trend_bullish=_r_trend_bullish,
+        macd_bullish=_r_macd_bullish,
+        rsi=_r_rsi,
+        price_vs_sma_pct=_r_price_vs_sma,
+        breadth_ratio=_macro_snap.breadth_ratio if _macro_snap else None,
+        breadth_signal=_macro_snap.breadth_signal if _macro_snap else None,
+        macro_risk_score=_macro_snap.risk_score if _macro_snap else None,
+        gold_df=_gold_df,
+        tnx_df=_tnx_df,
+    )
+except Exception as _regime_err:
+    print(f"[regime] Error: {_regime_err}")
+    # Safe fallback — use original simple call that always works
+    try:
+        _global_regime = detect_regime_stocks(
+            vix=vix_value,
+            macro_risk_score=_macro_snap.risk_score if _macro_snap else None,
+            gold_df=_gold_df,
+            tnx_df=_tnx_df,
+        )
+    except Exception:
+        pass
 
 
 # ── HEATMAP ───────────────────────────────────────────────────────────────────
@@ -443,8 +499,12 @@ render_heatmap()
 render_macro_panel()
 
 # ── SMART BREADTH QUALITY ENGINE ──────────────────────────────────────────────
-_breadth_quality = get_breadth_quality()
-render_breadth_quality_panel(_breadth_quality)
+_breadth_quality = None
+try:
+    _breadth_quality = get_breadth_quality()
+    render_breadth_quality_panel(_breadth_quality)
+except Exception as _bqe:
+    st.warning(f"Breadth quality error: {_bqe}")
 
 # ── NAS100 ────────────────────────────────────────────────────────────────────
 st.subheader("📈 Nasdaq 100 Cash CFD (NAS100)")
@@ -461,42 +521,12 @@ except Exception as e:
     with nas_col:
         st.error(f"NAS100 error: {e}")
 
-# ── COMPUTE REGIME NOW — with full live NAS100 indicator data ─────────────────
-# BUG 2 FIX: pass trend_bullish, macd_bullish, rsi, price_vs_sma from nas_ind
-# BUG 3 FIX: pass df_5m so ATR is computed live
-# BUG 4 FIX: pass breadth_signal string from macro_snap
-_nas_5m_regime = get_5m(NAS100_LABEL)
-if nas_ind:
-    _price_vs_sma_pct = (
-        (float(nas_ind['curr_p']) - float(nas_ind['sma200_1h']))
-        / float(nas_ind['sma200_1h']) * 100
-        if nas_ind['sma200_1h'] and nas_ind['sma200_1h'] > 0 else 1.0
-    )
-    _global_regime = detect_regime_stocks(
-        vix=vix_value,
-        df_5m=_nas_5m_regime,
-        trend_bullish=(nas_ind['trend_status'] == 'BULLISH'),
-        macd_bullish=nas_ind['macd_bullish'],
-        rsi=float(nas_ind['rsi']),
-        price_vs_sma_pct=_price_vs_sma_pct,
-        breadth_ratio=_macro_snap.breadth_ratio if _macro_snap else None,
-        breadth_signal=_macro_snap.breadth_signal if _macro_snap else None,
-        macro_risk_score=_macro_snap.risk_score if _macro_snap else None,
-        gold_df=_gold_df,
-        tnx_df=_tnx_df,
-    )
-else:
-    # Fallback with partial data if nas_ind unavailable
-    _global_regime = detect_regime_stocks(
-        vix=vix_value,
-        df_5m=_nas_5m_regime,
-        breadth_signal=_macro_snap.breadth_signal if _macro_snap else None,
-        macro_risk_score=_macro_snap.risk_score if _macro_snap else None,
-        gold_df=_gold_df,
-        tnx_df=_tnx_df,
-    )
-
-render_regime_panel(_global_regime, "Market Regime Detector")
+# ── REGIME PANEL ─────────────────────────────────────────────────────────────
+if _global_regime:
+    try:
+        render_regime_panel(_global_regime, "Market Regime Detector")
+    except Exception as _re:
+        st.warning(f"Regime panel error: {_re}")
 
 # ── OPTIONS INTELLIGENCE PANEL (NAS100 only) ──────────────────────────────────
 # ── MASTER SIGNAL ─────────────────────────────────────────────────────────────
@@ -531,17 +561,25 @@ if _nas_price_ms:
     except Exception:
         pass
 
-_master_sig = compute_master_signal(
-    ind=nas_ind,
-    macro_snap=_macro_snap,
-    regime=_global_regime,
-    gex=_gex_ms,
-    heatmap=_heatmap_ms,
-    expected_move=_em_ms,
-    breadth_quality=_breadth_quality,
-    scalp_report=_scalp_for_ms,
-)
-render_master_signal(_master_sig, risk_config)
+_master_sig = None
+try:
+    _master_sig = compute_master_signal(
+        ind=nas_ind,
+        macro_snap=_macro_snap,
+        regime=_global_regime,
+        gex=_gex_ms,
+        heatmap=_heatmap_ms,
+        expected_move=_em_ms,
+        breadth_quality=_breadth_quality,
+        scalp_report=_scalp_for_ms,
+    )
+except Exception as _mse:
+    st.warning(f"Master signal error: {_mse}")
+
+try:
+    render_master_signal(_master_sig, risk_config)
+except Exception as _mre:
+    st.warning(f"Master signal render error: {_mre}")
 
 st.divider()
 
