@@ -93,17 +93,11 @@ elif fetch_elapsed > 15:
 
 vix_value = get_vix()
 
-# ── COMPUTE GLOBAL REGIME ─────────────────────────────────────────────────────
-_macro_snap  = get_macro_snapshot()
-_gold_df     = get_gold_df()
-_tnx_df      = get_macro_df("tnx")
-_global_regime = detect_regime_stocks(
-    vix=vix_value,
-    macro_risk_score=_macro_snap.risk_score if _macro_snap else None,
-    breadth_ratio=_macro_snap.breadth_ratio if _macro_snap else None,
-    gold_df=_gold_df,
-    tnx_df=_tnx_df,
-)
+# ── MACRO SNAPSHOT (regime computed after nas_ind — BUG 2 FIX) ───────────────
+_macro_snap    = get_macro_snapshot()
+_gold_df       = get_gold_df()
+_tnx_df        = get_macro_df("tnx")
+_global_regime = None   # populated after nas_ind is computed below
 
 
 # ── HEATMAP ───────────────────────────────────────────────────────────────────
@@ -339,7 +333,7 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
 
                 if not session_ok:
                     st.caption(session_msg)
-                elif _global_regime.state == 2:
+                elif _global_regime is not None and _global_regime.state == 2:
                     st.error(f"🔴 {_global_regime.icon} CRISIS regime — no new entries. {_global_regime.strategy_note}")
                 else:
                     trade_allowed, trade_reason = check_trade_allowed(risk_config, ind["label"])
@@ -351,7 +345,7 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
                     )
 
                     effective_lot = round(
-                        risk_config.lot_size * _global_regime.lot_multiplier, 2
+                        risk_config.lot_size * (_global_regime.lot_multiplier if _global_regime else 1.0), 2
                     )
                     effective_lot = max(effective_lot, 0.01)
 
@@ -447,7 +441,6 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
 
 render_heatmap()
 render_macro_panel()
-render_regime_panel(_global_regime, "Market Regime Detector")
 
 # ── SMART BREADTH QUALITY ENGINE ──────────────────────────────────────────────
 _breadth_quality = get_breadth_quality()
@@ -467,6 +460,43 @@ try:
 except Exception as e:
     with nas_col:
         st.error(f"NAS100 error: {e}")
+
+# ── COMPUTE REGIME NOW — with full live NAS100 indicator data ─────────────────
+# BUG 2 FIX: pass trend_bullish, macd_bullish, rsi, price_vs_sma from nas_ind
+# BUG 3 FIX: pass df_5m so ATR is computed live
+# BUG 4 FIX: pass breadth_signal string from macro_snap
+_nas_5m_regime = get_5m(NAS100_LABEL)
+if nas_ind:
+    _price_vs_sma_pct = (
+        (float(nas_ind['curr_p']) - float(nas_ind['sma200_1h']))
+        / float(nas_ind['sma200_1h']) * 100
+        if nas_ind['sma200_1h'] and nas_ind['sma200_1h'] > 0 else 1.0
+    )
+    _global_regime = detect_regime_stocks(
+        vix=vix_value,
+        df_5m=_nas_5m_regime,
+        trend_bullish=(nas_ind['trend_status'] == 'BULLISH'),
+        macd_bullish=nas_ind['macd_bullish'],
+        rsi=float(nas_ind['rsi']),
+        price_vs_sma_pct=_price_vs_sma_pct,
+        breadth_ratio=_macro_snap.breadth_ratio if _macro_snap else None,
+        breadth_signal=_macro_snap.breadth_signal if _macro_snap else None,
+        macro_risk_score=_macro_snap.risk_score if _macro_snap else None,
+        gold_df=_gold_df,
+        tnx_df=_tnx_df,
+    )
+else:
+    # Fallback with partial data if nas_ind unavailable
+    _global_regime = detect_regime_stocks(
+        vix=vix_value,
+        df_5m=_nas_5m_regime,
+        breadth_signal=_macro_snap.breadth_signal if _macro_snap else None,
+        macro_risk_score=_macro_snap.risk_score if _macro_snap else None,
+        gold_df=_gold_df,
+        tnx_df=_tnx_df,
+    )
+
+render_regime_panel(_global_regime, "Market Regime Detector")
 
 # ── OPTIONS INTELLIGENCE PANEL (NAS100 only) ──────────────────────────────────
 # ── MASTER SIGNAL ─────────────────────────────────────────────────────────────
