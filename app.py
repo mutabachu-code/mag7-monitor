@@ -748,6 +748,111 @@ if _nas_5m is not None and nas_ind:
                 for sw in _nas_scalp.liquidity_sweeps[:2]:
                     st.caption(f"• {sw.signal_text[:120]}")
 
+        # ── CPR PANEL ─────────────────────────────────────────────────────────
+        if _nas_scalp.cpr:
+            cpr = _nas_scalp.cpr
+            st.markdown("---")
+            st.markdown("**📐 Central Pivot Range (CPR)**")
+
+            # CPR type banner
+            cpr_banner_colors = {
+                "NARROW":   ("#2d9e2d", "🎯"),
+                "MODERATE": ("#e6a817", "⚖️"),
+                "WIDE":     ("#c9302c", "🌊"),
+            }
+            b_color, b_icon = cpr_banner_colors.get(cpr.cpr_type, ("#888", "📐"))
+            virgin_badge = (
+                " &nbsp;|&nbsp; <span style='color:#aa44ff'>🔮 VIRGIN CPR</span>"
+                if cpr.virgin else ""
+            )
+            st.markdown(
+                f"<div style='padding:8px 12px;border-radius:6px;"
+                f"background:{b_color}22;border-left:3px solid {b_color};"
+                f"margin-bottom:8px'>"
+                f"<span style='color:{b_color};font-weight:bold'>"
+                f"{b_icon} {cpr.cpr_type} CPR</span>"
+                f"<span style='color:#aaa;font-size:0.88em;margin-left:10px'>"
+                f"Width: {cpr.cpr_width:.0f} pts ({cpr.cpr_width_pct:.2f}%)"
+                f"{virgin_badge}</span><br>"
+                f"<span style='color:#ccc;font-size:0.85em'>{cpr.cpr_type_bias}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            # Levels grid
+            cpr_c1, cpr_c2, cpr_c3 = st.columns(3)
+
+            with cpr_c1:
+                st.markdown("**Key CPR Levels**")
+                for label, val in [
+                    ("R2", cpr.r2), ("R1", cpr.r1),
+                    ("TC", cpr.tc), ("Pivot", cpr.pivot), ("BC", cpr.bc),
+                    ("S1", cpr.s1), ("S2", cpr.s2),
+                ]:
+                    dist  = val - _nas_price
+                    is_tc = label == "TC"
+                    is_bc = label == "BC"
+                    is_p  = label == "Pivot"
+                    color = (
+                        "#aa44ff" if (is_tc or is_bc or is_p) else
+                        "#c9302c" if dist > 0 else "#2d9e2d"
+                    )
+                    bold = "font-weight:bold" if (is_tc or is_bc or is_p) else ""
+                    st.markdown(
+                        f"<span style='color:{color};{bold}'>"
+                        f"{label}: {val:,.0f} "
+                        f"<span style='color:#666;font-size:0.8em'>"
+                        f"({dist:+.0f} pts)</span></span>",
+                        unsafe_allow_html=True,
+                    )
+
+            with cpr_c2:
+                st.markdown("**Price vs CPR**")
+                pos_colors = {
+                    "ABOVE_TC": "#2d9e2d",
+                    "INSIDE":   "#e6a817",
+                    "BELOW_BC": "#c9302c",
+                }
+                pos_labels = {
+                    "ABOVE_TC": "▲ Above TC — Bullish",
+                    "INSIDE":   "◆ Inside CPR — Indecision",
+                    "BELOW_BC": "▼ Below BC — Bearish",
+                }
+                pc = cpr.price_vs_cpr
+                st.markdown(
+                    f"<span style='color:{pos_colors.get(pc,'#888')};"
+                    f"font-size:1.05em;font-weight:bold'>"
+                    f"{pos_labels.get(pc, pc)}</span>",
+                    unsafe_allow_html=True,
+                )
+                st.caption(f"TC: {cpr.tc:,.0f} | Pivot: {cpr.pivot:,.0f} | BC: {cpr.bc:,.0f}")
+                if cpr.virgin:
+                    st.markdown(
+                        "<span style='color:#aa44ff;font-weight:bold'>"
+                        "🔮 Virgin CPR — untested magnet zone</span>",
+                        unsafe_allow_html=True,
+                    )
+
+            with cpr_c3:
+                st.markdown("**CPR Signal**")
+                if cpr.setup:
+                    s = cpr.setup
+                    s_col = "#2d9e2d" if s.direction == "BUY" else "#c9302c"
+                    st.markdown(
+                        f"<span style='color:{s_col};font-weight:bold'>"
+                        f"{'🟢' if s.direction == 'BUY' else '🔴'} "
+                        f"CPR {s.direction} — {s.strength}</span>",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(s.description[:130])
+                    c_a, c_b = st.columns(2)
+                    c_a.metric("Target",      f"{s.target:,.0f}")
+                    c_b.metric("Invalidation",f"{s.invalidation:,.0f}")
+                elif cpr.setup_description:
+                    st.caption(cpr.setup_description)
+                else:
+                    st.caption("No active CPR signal at current price.")
+
     except Exception as _se:
         st.warning(f"NAS100 scalping unavailable: {_se}")
 else:
