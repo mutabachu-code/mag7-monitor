@@ -63,6 +63,35 @@ class LiquiditySweepDetail:
 
 
 @dataclass
+class CPRLevels:
+    """
+    Central Pivot Range for the current day.
+    Calculated from previous day's High / Low / Close (QQQ scaled to NAS100).
+    """
+    pivot: float          # P  = (H + L + C) / 3
+    bc: float             # Bottom Central = (H + L) / 2
+    tc: float             # Top Central    = (P - BC) + P
+    r1: float             # R1 = 2P - L
+    r2: float             # R2 = P + (H - L)
+    r3: float             # R3 = H + 2(P - L)
+    s1: float             # S1 = 2P - H
+    s2: float             # S2 = P - (H - L)
+    s3: float             # S3 = L - 2(H - P)
+
+    cpr_width: float      # TC - BC in points
+    cpr_width_pct: float  # CPR width as % of pivot price
+    cpr_type: str         # "NARROW" | "MODERATE" | "WIDE"
+    cpr_type_bias: str    # "TRENDING DAY expected" | "SIDEWAYS DAY expected"
+
+    virgin: bool          # True if price hasn't touched CPR yet today
+    price_vs_cpr: str     # "ABOVE_TC" | "INSIDE" | "BELOW_BC"
+
+    # Active CPR setup
+    setup: Optional["ScalpSetup"] = None
+    setup_description: str = ""
+
+
+@dataclass
 class ScalpReport:
     """Full scalping analysis for one instrument."""
     ticker: str
@@ -83,6 +112,9 @@ class ScalpReport:
     key_levels: List[float] = field(default_factory=list)
     key_level_setup: Optional[ScalpSetup] = None
     open_drive: Optional[str] = None  # "BULLISH" | "BEARISH" | "CHOPPY"
+
+    # CPR (Central Pivot Range)
+    cpr: Optional[CPRLevels] = None
 
     # Enhanced liquidity sweeps (NAS100)
     liquidity_sweeps: List[LiquiditySweepDetail] = field(default_factory=list)
@@ -721,7 +753,8 @@ def _detect_gap_fill(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
 
 def _detect_key_levels(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
                         current_price: float,
-                        ratio: float = 40.0) -> tuple:
+                        ratio: float = 40.0,
+                        extra_levels: list = None) -> tuple:
     levels = []
     if df_1d is not None and len(df_1d) >= 2:
         df1 = df_1d.copy()
@@ -736,6 +769,10 @@ def _detect_key_levels(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
 
     base   = round(current_price / 500) * 500
     levels.extend([base - 500, base, base + 500, base + 1000])
+
+    # Inject CPR levels passed from analyse_nas100_scalp
+    if extra_levels:
+        levels.extend([l for l in extra_levels if l and l > 0])
 
     if not levels:
         return [], None
@@ -761,6 +798,257 @@ def _detect_key_levels(df_1d: pd.DataFrame, df_5m: pd.DataFrame,
         pips_to_target=100.0,
         risk_pips=30.0,
     )
+
+
+def _compute_cpr(df_1d: pd.DataFrame,
+                  df_5m: pd.DataFrame,
+                  current_price: float,
+                  ratio: float = 40.0) -> Optional[CPRLevels]:
+    """
+    Central Pivot Range (CPR) — calculated from previous day OHLC.
+    All prices scaled to NAS100 index points via ratio.
+
+    CPR Strategy signals:
+      1. NARROW CPR  (<0.3% width) → trending day expected
+         - Price opens above TC → look for LONG on first pullback to TC
+         - Price opens below BC → look for SHORT on first bounce to BC
+
+      2. WIDE CPR (>0.6% width) → sideways/choppy day expected
+         - Fade extremes: sell at R1/R2, buy at S1/S2
+         - Avoid breakout trades inside CPR range
+
+      3. VIRGIN CPR (price hasn't touched CPR today)
+         → CPR acts as a magnet — high probability move toward it
+
+      4. Price inside CPR → indecision zone, wait for TC/BC break confirmation
+
+      5. TC/BC flip signals:
+         - Price above TC → TC becomes support (buy dips to TC)
+         - Price below BC → BC becomes resistance (sell bounces to BC)
+    """
+    if df_1d is None or len(df_1d) < 2:
+        return None
+
+    try:
+        d1 = df_1d.copy()
+        d1.columns = [c.capitalize() for c in d1.columns]
+
+        # Previous day OHLC scaled to NAS100
+        prev_high  = float(d1['High'].iloc[-2])  * ratio
+        prev_low   = float(d1['Low'].iloc[-2])   * ratio
+        prev_close = float(d1['Close'].iloc[-2]) * ratio
+
+        # ── CORE CPR LEVELS ───────────────────────────────────────────────────
+        pivot = (prev_high + prev_low + prev_close) / 3
+        bc    = (prev_high + prev_low) / 2
+        tc    = (pivot - bc) + pivot
+
+        # Ensure TC > BC (sometimes equal on flat days)
+        if tc < bc:
+            tc, bc = bc, tc
+
+        # ── STANDARD PIVOTS (R1-R3, S1-S3) ───────────────────────────────────
+        r1 = 2 * pivot - prev_low
+        r2 = pivot + (prev_high - prev_low)
+        r3 = prev_high + 2 * (pivot - prev_low)
+        s1 = 2 * pivot - prev_high
+        s2 = pivot - (prev_high - prev_low)
+        s3 = prev_low - 2 * (prev_high - pivot)
+
+        # ── CPR WIDTH CLASSIFICATION ──────────────────────────────────────────
+        cpr_width     = round(tc - bc, 0)
+        cpr_width_pct = round(cpr_width / pivot * 100, 3) if pivot > 0 else 0
+
+        if cpr_width_pct < 0.25:
+            cpr_type      = "NARROW"
+            cpr_type_bias = "Trending day likely — strong directional move expected"
+        elif cpr_width_pct < 0.55:
+            cpr_type      = "MODERATE"
+            cpr_type_bias = "Mixed day — watch for breakout direction from CPR"
+        else:
+            cpr_type      = "WIDE"
+            cpr_type_bias = "Sideways/choppy day likely — fade extremes, avoid breakouts"
+
+        # ── PRICE vs CPR POSITION ─────────────────────────────────────────────
+        if current_price > tc:
+            price_vs_cpr = "ABOVE_TC"
+        elif current_price < bc:
+            price_vs_cpr = "BELOW_BC"
+        else:
+            price_vs_cpr = "INSIDE"
+
+        # ── VIRGIN CPR (hasn't been tested today) ─────────────────────────────
+        virgin = True
+        if df_5m is not None and len(df_5m) > 5:
+            df5 = df_5m.copy()
+            df5.columns = [c.capitalize() for c in df5.columns]
+            df5.index   = pd.to_datetime(df5.index, utc=True)
+            today = pd.Timestamp.now(tz='UTC').date()
+            today_bars = df5[df5.index.date == today]
+
+            if not today_bars.empty:
+                today_high = float(today_bars['High'].max())  * ratio
+                today_low  = float(today_bars['Low'].min())   * ratio
+                # Touched CPR if today's range overlaps CPR zone
+                if today_high >= bc and today_low <= tc:
+                    virgin = False
+
+        # ── CPR SETUP SIGNAL ──────────────────────────────────────────────────
+        setup       = None
+        setup_desc  = ""
+        p           = current_price
+
+        if cpr_type == "NARROW":
+            # Narrow CPR → trending day setup
+            if price_vs_cpr == "ABOVE_TC":
+                # TC is now support — buy dips to TC
+                entry_low  = round(tc - cpr_width * 0.3, 0)
+                entry_high = round(tc + cpr_width * 0.5, 0)
+                target     = round(r1, 0)
+                inval      = round(bc - cpr_width, 0)
+                risk       = max(p - inval, 20)
+                if target > p and risk > 0:
+                    setup = ScalpSetup(
+                        pair="NAS100", setup_type="CPR", direction="BUY",
+                        entry_zone_high=entry_high, entry_zone_low=entry_low,
+                        target=target, invalidation=inval,
+                        strength="STRONG",
+                        description=(
+                            f"NARROW CPR BUY — Trending day. "
+                            f"TC ({tc:,.0f}) flipped to support. "
+                            f"Buy dips {entry_low:,.0f}–{entry_high:,.0f}, "
+                            f"target R1 {target:,.0f}. Invalidate below BC {bc:,.0f}."
+                        ),
+                        pips_to_target=round(target - p, 0),
+                        risk_pips=round(risk, 0),
+                    )
+                    setup_desc = f"Narrow CPR: TC={tc:,.0f} support. Trending LONG day."
+
+            elif price_vs_cpr == "BELOW_BC":
+                # BC is now resistance — sell bounces to BC
+                entry_low  = round(bc - cpr_width * 0.5, 0)
+                entry_high = round(bc + cpr_width * 0.3, 0)
+                target     = round(s1, 0)
+                inval      = round(tc + cpr_width, 0)
+                risk       = max(inval - p, 20)
+                if target < p and risk > 0:
+                    setup = ScalpSetup(
+                        pair="NAS100", setup_type="CPR", direction="SELL",
+                        entry_zone_high=entry_high, entry_zone_low=entry_low,
+                        target=target, invalidation=inval,
+                        strength="STRONG",
+                        description=(
+                            f"NARROW CPR SELL — Trending day. "
+                            f"BC ({bc:,.0f}) flipped to resistance. "
+                            f"Sell bounces {entry_low:,.0f}–{entry_high:,.0f}, "
+                            f"target S1 {target:,.0f}. Invalidate above TC {tc:,.0f}."
+                        ),
+                        pips_to_target=round(p - target, 0),
+                        risk_pips=round(risk, 0),
+                    )
+                    setup_desc = f"Narrow CPR: BC={bc:,.0f} resistance. Trending SHORT day."
+
+            elif virgin:
+                # Virgin narrow CPR — price will be attracted to it
+                if p > tc:
+                    direction = "SELL"
+                    target    = round(pivot, 0)
+                    inval     = round(r1 + 20, 0)
+                else:
+                    direction = "BUY"
+                    target    = round(pivot, 0)
+                    inval     = round(s1 - 20, 0)
+                risk = abs(p - inval)
+                if risk > 0:
+                    entry_low  = round(min(p, tc) - 10, 0)
+                    entry_high = round(max(p, tc) + 10, 0)
+                    setup = ScalpSetup(
+                        pair="NAS100", setup_type="CPR", direction=direction,
+                        entry_zone_high=entry_high, entry_zone_low=entry_low,
+                        target=target, invalidation=inval,
+                        strength="MEDIUM",
+                        description=(
+                            f"VIRGIN NARROW CPR — Magnet effect. "
+                            f"CPR {bc:,.0f}–{tc:,.0f} untested today. "
+                            f"Price likely attracted to pivot {pivot:,.0f}."
+                        ),
+                        pips_to_target=round(abs(p - target), 0),
+                        risk_pips=round(risk, 0),
+                    )
+                    setup_desc = f"Virgin CPR magnet: pivot={pivot:,.0f} target."
+
+        elif cpr_type == "WIDE":
+            # Wide CPR → range day, fade R1/S1 levels
+            near_r1 = abs(p - r1) / max(p, 1) < 0.002   # within 0.2% of R1
+            near_s1 = abs(p - s1) / max(p, 1) < 0.002
+
+            if near_r1 and price_vs_cpr == "ABOVE_TC":
+                target = round(pivot, 0)
+                inval  = round(r2 + 20, 0)
+                risk   = max(inval - p, 15)
+                setup  = ScalpSetup(
+                    pair="NAS100", setup_type="CPR", direction="SELL",
+                    entry_zone_high=round(r1 + 15, 0),
+                    entry_zone_low=round(r1 - 15, 0),
+                    target=target, invalidation=inval,
+                    strength="MEDIUM",
+                    description=(
+                        f"WIDE CPR — Fade R1 ({r1:,.0f}). "
+                        f"Choppy day expected. Sell at R1, target pivot {target:,.0f}. "
+                        f"Avoid new breakout longs."
+                    ),
+                    pips_to_target=round(p - target, 0),
+                    risk_pips=round(risk, 0),
+                )
+                setup_desc = f"Wide CPR: Fade R1={r1:,.0f}. Range day."
+
+            elif near_s1 and price_vs_cpr == "BELOW_BC":
+                target = round(pivot, 0)
+                inval  = round(s2 - 20, 0)
+                risk   = max(p - inval, 15)
+                setup  = ScalpSetup(
+                    pair="NAS100", setup_type="CPR", direction="BUY",
+                    entry_zone_high=round(s1 + 15, 0),
+                    entry_zone_low=round(s1 - 15, 0),
+                    target=target, invalidation=inval,
+                    strength="MEDIUM",
+                    description=(
+                        f"WIDE CPR — Fade S1 ({s1:,.0f}). "
+                        f"Choppy day expected. Buy at S1, target pivot {target:,.0f}. "
+                        f"Avoid new breakdown shorts."
+                    ),
+                    pips_to_target=round(target - p, 0),
+                    risk_pips=round(risk, 0),
+                )
+                setup_desc = f"Wide CPR: Fade S1={s1:,.0f}. Range day."
+
+        else:
+            # MODERATE CPR — watch for breakout confirmation
+            if price_vs_cpr == "INSIDE":
+                setup_desc = (
+                    f"Price INSIDE CPR ({bc:,.0f}–{tc:,.0f}). "
+                    f"Wait for close above TC or below BC before entering."
+                )
+
+        return CPRLevels(
+            pivot=round(pivot, 0),
+            bc=round(bc, 0),
+            tc=round(tc, 0),
+            r1=round(r1, 0), r2=round(r2, 0), r3=round(r3, 0),
+            s1=round(s1, 0), s2=round(s2, 0), s3=round(s3, 0),
+            cpr_width=cpr_width,
+            cpr_width_pct=cpr_width_pct,
+            cpr_type=cpr_type,
+            cpr_type_bias=cpr_type_bias,
+            virgin=virgin,
+            price_vs_cpr=price_vs_cpr,
+            setup=setup,
+            setup_description=setup_desc,
+        )
+
+    except Exception as e:
+        print(f"[scalping] CPR error: {e}")
+        return None
 
 
 def _detect_open_drive(df_5m: pd.DataFrame) -> str:
@@ -820,12 +1108,13 @@ def analyse_nas100_scalp(df_5m: pd.DataFrame,
                           current_price: float,
                           qqq_to_nas100_ratio: float = 40.0) -> ScalpReport:
     """
-    Run all NAS100 scalping detectors including enhanced liquidity sweep detection.
+    Run all NAS100 scalping detectors including CPR and enhanced liquidity sweeps.
     current_price is NAS100 index points (~19000).
     """
     session = _get_session()
     report  = ScalpReport(ticker="NAS100", current_price=current_price, session=session)
 
+    # ── VWAP ─────────────────────────────────────────────────────────────────
     _raw_vwap = _calc_vwap(df_5m)
     report.vwap = round(_raw_vwap * qqq_to_nas100_ratio, 0) if _raw_vwap else None
     if report.vwap:
@@ -836,29 +1125,56 @@ def analyse_nas100_scalp(df_5m: pd.DataFrame,
             df_5m, report.vwap, current_price, qqq_to_nas100_ratio
         )
 
+    # ── GAP FILL ─────────────────────────────────────────────────────────────
     report.gap_fill_setup = _detect_gap_fill(df_1d, df_5m, current_price, qqq_to_nas100_ratio)
+
+    # ── CPR ──────────────────────────────────────────────────────────────────
+    try:
+        report.cpr = _compute_cpr(df_1d, df_5m, current_price, qqq_to_nas100_ratio)
+    except Exception as _ce:
+        print(f"[scalping] CPR skipped: {_ce}")
+        report.cpr = None
+
+    # ── KEY LEVELS (CPR levels injected as structural levels) ─────────────────
+    # Merge CPR levels into key_levels so they appear on the levels list
+    _extra_levels = []
+    if report.cpr:
+        _extra_levels = [
+            report.cpr.pivot, report.cpr.tc, report.cpr.bc,
+            report.cpr.r1, report.cpr.s1,
+            report.cpr.r2, report.cpr.s2,
+        ]
     report.key_levels, report.key_level_setup = _detect_key_levels(
-        df_1d, df_5m, current_price, qqq_to_nas100_ratio
+        df_1d, df_5m, current_price, qqq_to_nas100_ratio,
+        extra_levels=_extra_levels,
     )
+
+    # ── OPEN DRIVE ───────────────────────────────────────────────────────────
     report.open_drive = _detect_open_drive(df_5m)
 
-    # ── ENHANCED: Liquidity sweeps with RVOL confirmation ────────────────────
+    # ── LIQUIDITY SWEEPS ─────────────────────────────────────────────────────
     report.liquidity_sweeps = _detect_nas100_liquidity_sweeps(
         df_5m, df_1d, current_price, qqq_to_nas100_ratio
     )
-    # Most recent / strongest sweep becomes the active fade setup
     strong_sweeps = [s for s in report.liquidity_sweeps if s.rvol_spike]
     if strong_sweeps:
         report.active_fade_setup = strong_sweeps[0]
     elif report.liquidity_sweeps:
         report.active_fade_setup = report.liquidity_sweeps[0]
 
-    # Best overall setup
-    candidates = [s for s in [report.vwap_setup, report.gap_fill_setup,
-                               report.key_level_setup] if s is not None]
+    # ── BEST SETUP — CPR STRONG signals compete with other setups ────────────
+    candidates = [s for s in [
+        report.vwap_setup,
+        report.gap_fill_setup,
+        report.key_level_setup,
+        report.cpr.setup if report.cpr else None,
+    ] if s is not None]
+
     strong = [s for s in candidates if s.strength == "STRONG"]
     if strong:
-        report.best_setup = strong[0]
+        # Among STRONG setups, prefer CPR on narrow days (highest conviction)
+        cpr_strong = [s for s in strong if s.setup_type == "CPR"]
+        report.best_setup = cpr_strong[0] if cpr_strong else strong[0]
     elif candidates:
         report.best_setup = candidates[0]
 
