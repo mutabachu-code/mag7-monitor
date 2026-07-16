@@ -20,6 +20,10 @@ from options_intelligence import (
 )
 from breadth_quality import get_breadth_quality, render_breadth_quality_panel
 from master_signal import compute_master_signal, render_master_signal
+from nas100_breadth import (
+    get_nas100_breadth, compute_harmonized_signal,
+    render_nas100_breadth, render_harmonized_signal,
+)
 
 # ── SETUP ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Mag 7 + NAS100 Monitor", layout="wide")
@@ -580,6 +584,28 @@ try:
     render_master_signal(_master_sig, risk_config)
 except Exception as _mre:
     st.warning(f"Master signal render error: {_mre}")
+
+# ── NAS100 COMPONENT BREADTH (15-min cache — single batch fetch) ──────────────
+_nas100_breadth = None
+try:
+    _nas100_breadth = get_nas100_breadth()
+    render_nas100_breadth(_nas100_breadth)
+except Exception as _bre:
+    st.warning(f"NAS100 breadth error: {_bre}")
+
+# ── HARMONIZED FINAL SIGNAL ───────────────────────────────────────────────────
+try:
+    _harmonized = compute_harmonized_signal(
+        master_sig=_master_sig,
+        breadth=_nas100_breadth,
+        regime=_global_regime,
+        macro_snap=_macro_snap,
+        gex=_gex_ms,
+        expected_move=_em_ms,
+    )
+    render_harmonized_signal(_harmonized, risk_config)
+except Exception as _hse:
+    st.warning(f"Harmonized signal error: {_hse}")
 
 st.divider()
 
