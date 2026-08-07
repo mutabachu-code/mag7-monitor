@@ -513,12 +513,13 @@ def get_nas100_breadth() -> Optional[NAS100BreadthReport]:
 # ── HARMONIZED FINAL SIGNAL ───────────────────────────────────────────────────
 
 def compute_harmonized_signal(
-    master_sig,         # MasterSignal from master_signal.py
+    master_sig,
     breadth: Optional[NAS100BreadthReport],
-    regime,             # RegimeState
+    regime,
     macro_snap,
     gex,
     expected_move,
+    qqq_report=None,        # NEW — feeds PCR + IV skew + volume into conflict check
 ) -> Optional[HarmonizedSignal]:
     """
     Resolve all dashboard layers into ONE final actionable signal.
@@ -640,6 +641,25 @@ def compute_harmonized_signal(
             )
         else:
             confirmations.append("Positive GEX: mean-reversion favored")
+
+    # ── QQQ OPTIONS & VOLUME ──────────────────────────────────────────────────
+    if qqq_report:
+        if qqq_report.options:
+            pcr = qqq_report.options.put_call_ratio_oi
+            skew = qqq_report.options.iv_skew
+            if pcr > 1.3:
+                risks.append(f"QQQ PCR {pcr:.2f} — heavy put hedging across market")
+            elif pcr < 0.7:
+                risks.append(f"QQQ PCR {pcr:.2f} — extreme call complacency")
+            if skew > 4:
+                risks.append(f"IV skew {skew:.1f}% — elevated fear premium in puts")
+        if qqq_report.intraday:
+            iv2 = qqq_report.intraday
+            if iv2.vol_surge_ratio >= 2.0:
+                if iv2.change_pct < -0.3:
+                    risks.append(f"QQQ unusual volume ({iv2.vol_surge_ratio:.1f}×) on decline — distribution")
+                elif iv2.change_pct > 0.3:
+                    confirmations.append(f"QQQ unusual volume ({iv2.vol_surge_ratio:.1f}×) on advance — accumulation")
 
     # ── MACRO ─────────────────────────────────────────────────────────────────
     if macro_snap:
