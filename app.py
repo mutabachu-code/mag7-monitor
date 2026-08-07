@@ -24,6 +24,7 @@ from nas100_breadth import (
     get_nas100_breadth, compute_harmonized_signal,
     render_nas100_breadth, render_harmonized_signal,
 )
+from qqq_intelligence import get_qqq_report, render_qqq_intelligence
 
 # ── SETUP ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Mag 7 + NAS100 Monitor", layout="wide")
@@ -567,6 +568,14 @@ if _nas_price_ms:
 
 _master_sig = None
 try:
+    # QQQ report fetched here so it feeds master_signal Layer 6
+    # Uses its own internal per-section cache — safe to call every refresh
+    from qqq_intelligence import get_qqq_report as _get_qqq
+    _qqq_report_ms = _get_qqq()
+except Exception:
+    _qqq_report_ms = None
+
+try:
     _master_sig = compute_master_signal(
         ind=nas_ind,
         macro_snap=_macro_snap,
@@ -576,6 +585,7 @@ try:
         expected_move=_em_ms,
         breadth_quality=_breadth_quality,
         scalp_report=_scalp_for_ms,
+        qqq_report=_qqq_report_ms,
     )
 except Exception as _mse:
     st.warning(f"Master signal error: {_mse}")
@@ -602,6 +612,7 @@ try:
         macro_snap=_macro_snap,
         gex=_gex_ms,
         expected_move=_em_ms,
+        qqq_report=_qqq_report_ms,
     )
     render_harmonized_signal(_harmonized, risk_config)
 except Exception as _hse:
@@ -883,6 +894,15 @@ if _nas_5m is not None and nas_ind:
         st.warning(f"NAS100 scalping unavailable: {_se}")
 else:
     st.caption("NAS100 data not yet loaded.")
+
+st.divider()
+
+# ── QQQ ETF INTELLIGENCE ──────────────────────────────────────────────────────
+try:
+    _qqq_report = get_qqq_report()
+    render_qqq_intelligence(_qqq_report)
+except Exception as _qqq_err:
+    st.warning(f"QQQ Intelligence error: {_qqq_err}")
 
 st.divider()
 
