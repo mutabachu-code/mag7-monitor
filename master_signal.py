@@ -30,7 +30,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import time
 
 
@@ -386,6 +386,208 @@ def _score_technicals(ind: dict) -> LayerScore:
 
 # ── PRICE LEVEL CALCULATOR ────────────────────────────────────────────────────
 
+def _score_qqq_options(qqq_report) -> LayerScore:
+    """
+    Layer 6: QQQ Options Intelligence — max ±15 pts.
+    Reads PCR, IV skew, and unusual volume from qqq_intelligence.py.
+    Adds signals that master_signal previously missed entirely.
+    """
+    if qqq_report is None:
+        return LayerScore("QQQ Options", 0, 15, "Unavailable", "No QQQ report")
+
+    score   = 0
+    details = []
+    opt     = qqq_report.options
+    iv      = qqq_report.intraday
+    vol     = qqq_report.volume
+
+    # ── PUT-CALL RATIO ────────────────────────────────────────────────────────
+    if opt:
+        pcr = opt.put_call_ratio_oi
+        if pcr > 1.4:
+            # Heavy put buying = fear = bearish signal
+            score -= 8
+            details.append(f"PCR {pcr:.2f} — heavy put buying (fear)")
+        elif pcr > 1.2:
+            score -= 4
+            details.append(f"PCR {pcr:.2f} — elevated puts (caution)")
+        elif pcr < 0.6:
+            # Extreme call buying = complacency = fade signal
+            score -= 5
+            details.append(f"PCR {pcr:.2f} — extreme complacency (fade risk)")
+        elif pcr < 0.8:
+            score += 3
+            details.append(f"PCR {pcr:.2f} — mild call lean (moderate bullish)")
+        else:
+            score += 5
+            details.append(f"PCR {pcr:.2f} — balanced (neutral)")
+
+        # ── IV SKEW ───────────────────────────────────────────────────────────
+        # Positive skew = puts more expensive than calls = hedging/fear
+        # Negative skew = calls more expensive = bullish positioning
+        skew = opt.iv_skew
+        if skew > 5:
+            score -= 5
+            details.append(f"IV skew +{skew:.1f}% — put premium high (bearish fear)")
+        elif skew > 2:
+            score -= 2
+            details.append(f"IV skew +{skew:.1f}% — mild put premium")
+        elif skew < -3:
+            score += 4
+            details.append(f"IV skew {skew:.1f}% — call premium (bullish positioning)")
+        else:
+            score += 2
+            details.append(f"IV skew {skew:.1f}% — balanced")
+
+        # ── UNUSUAL OPTIONS ACTIVITY ──────────────────────────────────────────
+        if opt.unusual_puts and not opt.unusual_calls:
+            score -= 3
+            details.append("Unusual PUT activity only — institutional hedging")
+        elif opt.unusual_calls and not opt.unusual_puts:
+            score += 3
+            details.append("Unusual CALL activity only — institutional buying")
+
+    # ── QQQ VOLUME SIGNAL ─────────────────────────────────────────────────────
+    if iv:
+        vr = iv.vol_surge_ratio
+        if vr >= 2.0 and iv.change_pct < -0.5:
+            # High volume sell-off = institutional distribution
+            score -= 8
+            details.append(f"Unusual vol ({vr:.1f}x) on down move — distribution")
+        elif vr >= 2.0 and iv.change_pct > 0.5:
+            # High volume rally = institutional accumulation
+            score += 5
+            details.append(f"Unusual vol ({vr:.1f}x) on up move — accumulation")
+        elif vr >= 1.5:
+            # Elevated volume — amplifies price direction
+            if iv.change_pct < 0:
+                score -= 3
+                details.append(f"Elevated vol ({vr:.1f}x) on decline")
+            else:
+                score += 3
+                details.append(f"Elevated vol ({vr:.1f}x) on advance")
+
+    score = max(-15, min(15, score))
+    verdict = "Bullish" if score > 4 else ("Bearish" if score < -4 else "Neutral")
+    return LayerScore("QQQ Options+Vol", score, 15, verdict,
+                      " | ".join(details[:3]))
+
+
+def _resolve_conflicts(
+    direction: str,
+    conviction: str,
+    total_score: int,
+    layers: List[LayerScore],
+    regime,
+    gex,
+    expected_move,
+    qqq_report,
+    breadth_quality,
+) -> Tuple[str, str, List[str], List[str]]:
+    """
+    Explicit conflict resolver — catches situations where multiple layers
+    give contradictory signals and resolves them with clear rules.
+
+    Returns (resolved_direction, resolved_conviction, warnings, blockers)
+
+    Conflict rules:
+      C1: LONG signal + CHOP regime → downgrade to WEAK or HOLD
+      C2: MOMENTUM BUY signal + POSITIVE GEX → downgrade (GEX favors fades)
+      C3: Expected move >95% consumed + any entry signal → add warning, reduce conviction
+      C4: PCR >1.4 (fear) + LONG signal → warning, don't block but downgrade
+      C5: QQQ unusual volume DOWN + LONG signal → blocker (distribution)
+      C6: LONG signal + LOW breadth quality + bearish IV skew → downgrade to WEAK
+      C7: All layers agree same direction → upgrade conviction
+    """
+    warnings = []
+    blockers = []
+    new_dir  = direction
+    new_conv = conviction
+
+    tech_layer   = next((l for l in layers if l.name == "Technicals"), None)
+    opt_layer    = next((l for l in layers if l.name == "Options Intelligence"), None)
+    qqq_layer    = next((l for l in layers if l.name == "QQQ Options+Vol"), None)
+    regime_layer = next((l for l in layers if l.name == "Regime"), None)
+
+    raw_signal = tech_layer.detail if tech_layer else ""
+
+    # ── C1: LONG + CHOP regime ────────────────────────────────────────────────
+    if direction == "LONG" and regime and regime.state == 1:
+        warnings.append(
+            "CHOP regime active — momentum/breakout BUY signals have low win rate. "
+            "Only mean-reversion dip entries valid."
+        )
+        if conviction in ("STRONG", "MODERATE"):
+            new_conv = "WEAK"
+
+    # ── C2: MOMENTUM BUY + POSITIVE GEX ──────────────────────────────────────
+    if (direction == "LONG" and gex and gex.gamma_regime == "POSITIVE"
+            and ("MOMENTUM" in raw_signal or "BREAKOUT" in raw_signal)):
+        warnings.append(
+            f"Positive GEX contradicts momentum signal — "
+            f"dealers will SELL into this rally (fade regime). "
+            f"Consider mean-reversion SELL above {gex.gamma_flip_price:,.0f} instead."
+        )
+        if conviction == "STRONG":
+            new_conv = "MODERATE"
+
+    # ── C3: Expected move >95% consumed ──────────────────────────────────────
+    if expected_move and expected_move.exhaustion_pct >= 95:
+        rem = expected_move.expected_move_remaining_pts
+        warnings.append(
+            f"Expected move {expected_move.exhaustion_pct:.0f}% consumed — "
+            f"only ±{rem:.0f} pts remain. "
+            "High reversal risk. Tight stops or avoid new entries."
+        )
+        if direction in ("LONG", "SHORT") and conviction in ("STRONG", "MODERATE"):
+            new_conv = "WEAK"
+
+    # ── C4: High PCR fear + LONG ──────────────────────────────────────────────
+    if qqq_report and qqq_report.options:
+        pcr = qqq_report.options.put_call_ratio_oi
+        if direction == "LONG" and pcr > 1.4:
+            warnings.append(
+                f"PCR {pcr:.2f} — institutions are heavily hedged with puts. "
+                "This suggests fear or distribution ahead. Reduce long size."
+            )
+            if conviction == "STRONG":
+                new_conv = "MODERATE"
+
+        # ── C5: Unusual volume DOWN + LONG ────────────────────────────────────
+        if (direction == "LONG" and qqq_report.intraday
+                and qqq_report.intraday.vol_surge_ratio >= 2.0
+                and qqq_report.intraday.change_pct < -0.5):
+            blockers.append(
+                f"QQQ distribution signal: unusual volume "
+                f"({qqq_report.intraday.vol_surge_ratio:.1f}× average) "
+                f"on a {qqq_report.intraday.change_pct:.1f}% decline — "
+                "institutional selling. No long entries."
+            )
+            new_dir  = "HOLD"
+            new_conv = "AVOID"
+
+    # ── C6: LONG + LOW breadth + bearish IV skew ──────────────────────────────
+    if direction == "LONG" and breadth_quality and breadth_quality.quality_label == "LOW":
+        if qqq_report and qqq_report.options and qqq_report.options.iv_skew > 3:
+            warnings.append(
+                f"LOW breadth quality + bearish IV skew ({qqq_report.options.iv_skew:.1f}%) — "
+                "triple confirmation of weakness. Treat as WEAK signal only."
+            )
+            if new_conv in ("STRONG", "MODERATE"):
+                new_conv = "WEAK"
+
+    # ── C7: Layer agreement → upgrade ─────────────────────────────────────────
+    bull_layers = sum(1 for l in layers if l.score > l.max_pts * 0.4)
+    bear_layers = sum(1 for l in layers if l.score < -l.max_pts * 0.4)
+
+    if direction == "LONG"  and bull_layers >= 5 and new_conv == "MODERATE" and not warnings:
+        new_conv = "STRONG"
+    if direction == "SHORT" and bear_layers >= 5 and new_conv == "MODERATE" and not warnings:
+        new_conv = "STRONG"
+
+    return new_dir, new_conv, warnings, blockers
+
+
 def _build_price_levels(
     direction: str,
     current_price: float,
@@ -563,14 +765,15 @@ def _build_narrative(direction: str, conviction: str, layers: List[LayerScore],
 # ── MASTER AGGREGATOR ─────────────────────────────────────────────────────────
 
 def compute_master_signal(
-    ind: dict,                  # from compute_indicators()
-    macro_snap,                 # from get_macro_snapshot()
-    regime,                     # from detect_regime_stocks()
-    gex,                        # from get_gex()
-    heatmap,                    # from get_oi_heatmap()
-    expected_move,              # from get_expected_move()
-    breadth_quality,            # from get_breadth_quality()
-    scalp_report,               # from analyse_nas100_scalp()
+    ind: dict,
+    macro_snap,
+    regime,
+    gex,
+    heatmap,
+    expected_move,
+    breadth_quality,
+    scalp_report,
+    qqq_report=None,        # NEW: from get_qqq_report()
 ) -> Optional["MasterSignal"]:
     """
     Aggregate all dashboard signals into one Master Signal.
@@ -594,11 +797,14 @@ def compute_master_signal(
     l3, oi_support, oi_resistance, gamma_flip, em_remaining = l3_tuple
     l4, lot_adj_bq  = _score_breadth(breadth_quality)
     l5              = _score_technicals(ind)
+    l6              = _score_qqq_options(qqq_report)   # NEW Layer 6
 
-    layers      = [l1, l2, l3, l4, l5]
-    total_score = sum(l.score for l in layers)   # -100 to +100
+    layers      = [l1, l2, l3, l4, l5, l6]
+    total_score = sum(l.score for l in layers)   # now ±115 max
 
-    # ── BLOCKERS — hard stops regardless of score ─────────────────────────────
+    # ── INITIAL DIRECTION & CONVICTION ───────────────────────────────────────
+    # Scale score to ±100 range (total_score can be ±115 with 6 layers)
+    scaled_score = int(total_score * 100 / 115)
     blockers = []
     warnings = []
 
@@ -606,45 +812,57 @@ def compute_master_signal(
         blockers.append("CRISIS regime active — no new entries")
     if macro_snap and macro_snap.risk_score >= 70:
         blockers.append(f"Macro danger ({macro_snap.risk_score}/100)")
-    if expected_move and expected_move.exhaustion_pct >= 110:
-        warnings.append(f"Expected move exceeded ({expected_move.exhaustion_pct:.0f}%)")
-    if regime and regime.risk_off_active:
-        warnings.append(f"Risk-off: {regime.risk_off_reason[:40]}")
-    if breadth_quality and breadth_quality.quality_label == "LOW":
-        warnings.append("LOW breadth quality")
 
-    # ── DIRECTION & CONVICTION ────────────────────────────────────────────────
     if blockers:
         direction  = "HOLD"
         conviction = "AVOID"
-    elif total_score >= 50:
-        direction  = "LONG"
-        conviction = "STRONG"
-    elif total_score >= 25:
-        direction  = "LONG"
-        conviction = "MODERATE"
-    elif total_score >= 10:
-        direction  = "LONG"
-        conviction = "WEAK"
-    elif total_score <= -50:
-        direction  = "SHORT"
-        conviction = "STRONG"
-    elif total_score <= -25:
-        direction  = "SHORT"
-        conviction = "MODERATE"
-    elif total_score <= -10:
-        direction  = "SHORT"
-        conviction = "WEAK"
+    elif scaled_score >= 50:
+        direction, conviction = "LONG",  "STRONG"
+    elif scaled_score >= 25:
+        direction, conviction = "LONG",  "MODERATE"
+    elif scaled_score >= 10:
+        direction, conviction = "LONG",  "WEAK"
+    elif scaled_score <= -50:
+        direction, conviction = "SHORT", "STRONG"
+    elif scaled_score <= -25:
+        direction, conviction = "SHORT", "MODERATE"
+    elif scaled_score <= -10:
+        direction, conviction = "SHORT", "WEAK"
     else:
-        direction  = "HOLD"
-        conviction = "WEAK"
+        direction, conviction = "HOLD",  "WEAK"
 
-    # WEAK signals → downgrade to HOLD unless multiple strong layers agree
     if conviction == "WEAK":
         strong_layers = sum(1 for l in layers if abs(l.score) >= l.max_pts * 0.5)
         if strong_layers < 2:
-            direction  = "HOLD"
-            conviction = "WEAK"
+            direction = "HOLD"
+
+    # ── CONFLICT RESOLUTION (replaces manual warnings) ────────────────────────
+    if not blockers:
+        direction, conviction, conflict_warnings, conflict_blockers = _resolve_conflicts(
+            direction=direction,
+            conviction=conviction,
+            total_score=scaled_score,
+            layers=layers,
+            regime=regime,
+            gex=gex,
+            expected_move=expected_move,
+            qqq_report=qqq_report,
+            breadth_quality=breadth_quality,
+        )
+        warnings.extend(conflict_warnings)
+        blockers.extend(conflict_blockers)
+
+    # ── REMAINING STANDARD WARNINGS ───────────────────────────────────────────
+    if expected_move and expected_move.exhaustion_pct >= 110 and not any(
+        "expected move" in w.lower() for w in warnings
+    ):
+        warnings.append(f"Expected move exceeded ({expected_move.exhaustion_pct:.0f}%)")
+    if regime and regime.risk_off_active:
+        warnings.append(f"Risk-off: {regime.risk_off_reason[:40]}")
+    if breadth_quality and breadth_quality.quality_label == "LOW" and not any(
+        "breadth" in w.lower() for w in warnings
+    ):
+        warnings.append("LOW breadth quality")
 
     # ── PRICE LEVELS ─────────────────────────────────────────────────────────
     vwap = scalp_report.vwap if scalp_report else None
@@ -682,7 +900,7 @@ def compute_master_signal(
         lot_adj = 0.0
 
     # ── CONFIDENCE % (display) ───────────────────────────────────────────────
-    confidence_pct = min(100, int(abs(total_score)))
+    confidence_pct = min(100, int(abs(scaled_score)))
 
     # ── NARRATIVE ────────────────────────────────────────────────────────────
     summary = _build_narrative(direction, conviction, layers, warnings, blockers)
@@ -690,7 +908,7 @@ def compute_master_signal(
     result = MasterSignal(
         direction=direction,
         conviction=conviction,
-        conviction_score=total_score,
+        conviction_score=scaled_score,
         confidence_pct=confidence_pct,
         entry_zone=entry_zone,
         stop_loss=sl,
