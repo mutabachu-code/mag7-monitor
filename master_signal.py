@@ -533,7 +533,9 @@ def _resolve_conflicts(
 
     # ── C3: Expected move >95% consumed ──────────────────────────────────────
     if expected_move and expected_move.exhaustion_pct >= 95:
-        rem = expected_move.expected_move_remaining_pts
+        rem = getattr(expected_move, 'expected_move_remaining_pts',
+                      max(0.0, expected_move.expected_daily_move_pts
+                          - expected_move.actual_move_today_pts))
         warnings.append(
             f"Expected move {expected_move.exhaustion_pct:.0f}% consumed — "
             f"only ±{rem:.0f} pts remain. "
