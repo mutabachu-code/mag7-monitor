@@ -627,9 +627,12 @@ def compute_harmonized_signal(
 
     # ── EXPECTED MOVE RISK ────────────────────────────────────────────────────
     if expected_move and expected_move.exhaustion_pct >= 90:
+        em_rem = getattr(expected_move, 'expected_move_remaining_pts',
+                         max(0.0, expected_move.expected_daily_move_pts
+                             - expected_move.actual_move_today_pts))
         risks.append(
             f"Expected move {expected_move.exhaustion_pct:.0f}% consumed — "
-            f"only {expected_move.expected_move_remaining_pts:.0f} pts remain"
+            f"only {em_rem:.0f} pts remain"
         )
 
     # ── GEX CONTEXT ──────────────────────────────────────────────────────────
