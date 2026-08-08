@@ -79,6 +79,7 @@ class ExpectedMove:
     exhaustion_pct: float            # actual / expected * 100
     signal: str                      # e.g. "60% of expected move used — room to run"
     reversal_warning: bool
+    expected_move_remaining_pts: float = 0.0  # expected_daily_move_pts - actual_move_today_pts
 
 
 # ── CACHE ─────────────────────────────────────────────────────────────────────
@@ -360,6 +361,9 @@ def get_expected_move(current_price_nas100: float,
             cached.actual_move_today_pct = round(actual_pct, 2)
             cached.exhaustion_pct        = round(exhaustion, 1)
             cached.reversal_warning      = exhaustion >= 85
+            cached.expected_move_remaining_pts = round(
+                max(0.0, cached.expected_daily_move_pts - actual_pts), 0
+            )
             cached.signal = _build_em_signal(
                 exhaustion, actual_pts, cached.expected_daily_move_pts, current_price_nas100
             )
@@ -408,6 +412,9 @@ def get_expected_move(current_price_nas100: float,
             exhaustion_pct=round(exhaustion, 1),
             signal=signal,
             reversal_warning=(exhaustion >= 85),
+            expected_move_remaining_pts=round(
+                max(0.0, expected_move_pts - actual_pts), 0
+            ),
         )
 
         _store_oi(cache_key, result)
