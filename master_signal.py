@@ -473,6 +473,59 @@ def _score_qqq_options(qqq_report) -> LayerScore:
                       " | ".join(details[:3]))
 
 
+def _score_nq_futures(nq_report) -> LayerScore:
+    """
+    Layer 7: NQ Futures Confirmation — max ±15 pts.
+    Uses the NQ Futures Confirmation Score directly.
+    Most important signal: is NQ leading or lagging QQQ?
+    """
+    if nq_report is None or not nq_report.available:
+        return LayerScore("NQ Futures", 0, 15, "Unavailable",
+                          "NQ=F data not accessible — QQQ used as proxy")
+
+    score   = 0
+    details = []
+    nqs     = nq_report.score
+
+    if nqs:
+        # Use the pre-computed master_signal_pts directly (already ±15 range)
+        score = max(-15, min(15, nqs.master_signal_pts))
+        details.append(f"NQ score {nqs.score}/100 ({nqs.direction_bias})")
+
+    # Leadership override — most important signal
+    if nq_report.leadership:
+        lead = nq_report.leadership
+        if lead.confirmation == "DIVERGENT":
+            score = int(score * 0.3)   # heavily discount conflicted signal
+            details.append(f"⚠️ NQ/QQQ DIVERGENT ({lead.spread:+.2f}%)")
+        elif lead.confirmation == "CONFIRMED":
+            bonus = 3 if lead.spread > 0 else -3
+            score = max(-15, min(15, score + bonus))
+            details.append(f"NQ leading {'bullish' if lead.spread > 0 else 'bearish'}")
+
+    # VWAP slope confirmation
+    if nq_report.price:
+        p = nq_report.price
+        if p.price_vs_vwap == "ABOVE" and p.vwap_slope == "RISING":
+            score = min(15, score + 3)
+            details.append("NQ above rising VWAP")
+        elif p.price_vs_vwap == "BELOW" and p.vwap_slope == "FALLING":
+            score = max(-15, score - 3)
+            details.append("NQ below falling VWAP")
+
+    # Overnight range position
+    if nq_report.displacement:
+        pos = nq_report.displacement.position_in_overnight_range
+        if pos > 75:
+            score = min(15, score + 2)
+        elif pos < 25:
+            score = max(-15, score - 2)
+
+    verdict = "Bullish" if score > 4 else ("Bearish" if score < -4 else "Neutral")
+    return LayerScore("NQ Futures", score, 15, verdict,
+                      " | ".join(details[:2]))
+
+
 def _resolve_conflicts(
     direction: str,
     conviction: str,
@@ -775,7 +828,8 @@ def compute_master_signal(
     expected_move,
     breadth_quality,
     scalp_report,
-    qqq_report=None,        # NEW: from get_qqq_report()
+    qqq_report=None,        # from get_qqq_report()
+    nq_report=None,         # from get_nq_report() — Layer 7
 ) -> Optional["MasterSignal"]:
     """
     Aggregate all dashboard signals into one Master Signal.
@@ -799,14 +853,15 @@ def compute_master_signal(
     l3, oi_support, oi_resistance, gamma_flip, em_remaining = l3_tuple
     l4, lot_adj_bq  = _score_breadth(breadth_quality)
     l5              = _score_technicals(ind)
-    l6              = _score_qqq_options(qqq_report)   # NEW Layer 6
+    l6              = _score_qqq_options(qqq_report)   # Layer 6
+    l7              = _score_nq_futures(nq_report)      # Layer 7
 
-    layers      = [l1, l2, l3, l4, l5, l6]
-    total_score = sum(l.score for l in layers)   # now ±115 max
+    layers      = [l1, l2, l3, l4, l5, l6, l7]
+    total_score = sum(l.score for l in layers)   # ±130 max
 
     # ── INITIAL DIRECTION & CONVICTION ───────────────────────────────────────
     # Scale score to ±100 range (total_score can be ±115 with 6 layers)
-    scaled_score = int(total_score * 100 / 115)
+    scaled_score = int(total_score * 100 / 130)
     blockers = []
     warnings = []
 
