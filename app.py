@@ -25,6 +25,8 @@ from nas100_breadth import (
     render_nas100_breadth, render_harmonized_signal,
 )
 from qqq_intelligence import get_qqq_report, render_qqq_intelligence
+from nq_futures import get_nq_report, render_nq_panel
+from final_signal import compute_unified_signal, render_unified_signal
 
 # ── SETUP ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Mag 7 + NAS100 Monitor", layout="wide")
@@ -567,14 +569,32 @@ if _nas_price_ms:
         pass
 
 _master_sig = None
-try:
-    # QQQ report fetched here so it feeds master_signal Layer 6
-    # Uses its own internal per-section cache — safe to call every refresh
-    from qqq_intelligence import get_qqq_report as _get_qqq
-    _qqq_report_ms = _get_qqq()
-except Exception:
-    _qqq_report_ms = None
+_qqq_report_ms = None
+_nq_report = None
+_nas100_breadth = None
 
+# ── QQQ + NQ FETCH (shared across master + unified signal) ────────────────────
+try:
+    _qqq_report_ms = get_qqq_report()
+except Exception as _qe:
+    st.warning(f"QQQ data error: {_qe}")
+
+try:
+    _nq_report = get_nq_report(
+        qqq_ratio=_nas_ratio_ms,
+        qqq_5m_df=get_5m(NAS100_LABEL),
+    )
+except Exception as _nqe:
+    pass   # NQ silently degrades — not critical
+
+# ── NAS100 COMPONENT BREADTH (15-min cache) ───────────────────────────────────
+try:
+    _nas100_breadth = get_nas100_breadth()
+    render_nas100_breadth(_nas100_breadth)
+except Exception as _bre:
+    st.warning(f"NAS100 breadth error: {_bre}")
+
+# ── MASTER SIGNAL (legacy — kept for layer scoring, not rendered) ─────────────
 try:
     _master_sig = compute_master_signal(
         ind=nas_ind,
@@ -586,37 +606,40 @@ try:
         breadth_quality=_breadth_quality,
         scalp_report=_scalp_for_ms,
         qqq_report=_qqq_report_ms,
+        nq_report=_nq_report,
     )
 except Exception as _mse:
-    st.warning(f"Master signal error: {_mse}")
+    pass   # master signal feeds unified — failure degrades gracefully
 
+# ── NQ FUTURES PANEL ──────────────────────────────────────────────────────────
 try:
-    render_master_signal(_master_sig, risk_config)
-except Exception as _mre:
-    st.warning(f"Master signal render error: {_mre}")
+    qqq_intraday_for_nq = _qqq_report_ms.intraday if _qqq_report_ms else None
+    render_nq_panel(_nq_report, qqq_intraday=qqq_intraday_for_nq)
+except Exception as _nqre:
+    st.warning(f"NQ panel error: {_nqre}")
 
-# ── NAS100 COMPONENT BREADTH (15-min cache — single batch fetch) ──────────────
-_nas100_breadth = None
-try:
-    _nas100_breadth = get_nas100_breadth()
-    render_nas100_breadth(_nas100_breadth)
-except Exception as _bre:
-    st.warning(f"NAS100 breadth error: {_bre}")
+st.divider()
 
-# ── HARMONIZED FINAL SIGNAL ───────────────────────────────────────────────────
+# ── UNIFIED HARMONIZED FINAL SIGNAL ──────────────────────────────────────────
 try:
-    _harmonized = compute_harmonized_signal(
-        master_sig=_master_sig,
-        breadth=_nas100_breadth,
-        regime=_global_regime,
+    _unified = compute_unified_signal(
+        nas100_ind=nas_ind,
+        breadth_quality=_breadth_quality,
         macro_snap=_macro_snap,
+        nas100_breadth=_nas100_breadth,
         gex=_gex_ms,
+        heatmap=_heatmap_ms,
         expected_move=_em_ms,
+        scalp_report=_scalp_for_ms,
         qqq_report=_qqq_report_ms,
+        nq_report=_nq_report,
+        regime=_global_regime,
+        vix_value=vix_value,
+        risk_config=risk_config,
     )
-    render_harmonized_signal(_harmonized, risk_config)
-except Exception as _hse:
-    st.warning(f"Harmonized signal error: {_hse}")
+    render_unified_signal(_unified, risk_config)
+except Exception as _use:
+    st.warning(f"Unified signal error: {_use}")
 
 st.divider()
 
