@@ -665,47 +665,53 @@ def _build_score(price: Optional[NQPrice], volume: Optional[NQVolume],
 # ── MASTER FETCH ──────────────────────────────────────────────────────────────
 
 def get_nq_report(qqq_ratio: float = 40.0,
-                  qqq_5m_df: Optional[pd.DataFrame] = None) -> NQReport:
+                  qqq_5m_df: Optional[pd.DataFrame] = None) -> "NQReport":
     """
-    Main entry point. Fetches all NQ data with per-section caching.
-    qqq_ratio: QQQ-to-NAS100 multiplier (from data_fetcher)
-    qqq_5m_df: pass already-fetched QQQ 5m to avoid re-fetching
+    Main entry point. Always returns an NQReport — never raises.
+    available=False when NQ=F data cannot be fetched.
     """
+    _unavailable = NQReport(
+        price=None, volume=None, leadership=None,
+        displacement=None, basis=None, score=None,
+        fetched_at=pd.Timestamp.now().strftime("%H:%M:%S"),
+        available=False,
+    )
+
     key = "report"
     if _cv(key, TTL_LIVE):
         cached = _load(key)
-        if cached:
+        if cached is not None:
             return cached
 
-    nq_5m    = _fetch_nq_5m()
-    nq_daily = _fetch_nq_daily()
-    qqq_5m   = qqq_5m_df or _fetch_qqq_5m()
+    try:
+        nq_5m    = _fetch_nq_5m()
+        nq_daily = _fetch_nq_daily()
+        qqq_5m   = qqq_5m_df or _fetch_qqq_5m()
 
-    if nq_5m is None:
+        if nq_5m is None:
+            _store(key, _unavailable)
+            return _unavailable
+
+        price        = _build_nq_price(nq_5m, nq_daily)
+        volume       = _build_nq_volume(nq_5m, nq_daily)
+        leadership   = _build_leadership(nq_5m, qqq_5m)
+        displacement = _build_displacement(nq_5m)
+        basis        = _build_basis(price.price if price else 0, qqq_5m, qqq_ratio)
+        score        = _build_score(price, volume, leadership, displacement, basis)
+
         result = NQReport(
-            price=None, volume=None, leadership=None,
-            displacement=None, basis=None, score=None,
+            price=price, volume=volume, leadership=leadership,
+            displacement=displacement, basis=basis, score=score,
             fetched_at=pd.Timestamp.now().strftime("%H:%M:%S"),
-            available=False,
+            available=True,
         )
         _store(key, result)
         return result
 
-    price        = _build_nq_price(nq_5m, nq_daily)
-    volume       = _build_nq_volume(nq_5m, nq_daily)
-    leadership   = _build_leadership(nq_5m, qqq_5m)
-    displacement = _build_displacement(nq_5m)
-    basis        = _build_basis(price.price if price else 0, qqq_5m, qqq_ratio)
-    score        = _build_score(price, volume, leadership, displacement, basis)
-
-    result = NQReport(
-        price=price, volume=volume, leadership=leadership,
-        displacement=displacement, basis=basis, score=score,
-        fetched_at=pd.Timestamp.now().strftime("%H:%M:%S"),
-        available=True,
-    )
-    _store(key, result)
-    return result
+    except Exception as e:
+        print(f"[nq_futures] get_nq_report error: {e}")
+        _store(key, _unavailable)
+        return _unavailable
 
 
 # ── RENDER ────────────────────────────────────────────────────────────────────
