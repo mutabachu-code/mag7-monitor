@@ -584,8 +584,8 @@ try:
         qqq_ratio=_nas_ratio_ms,
         qqq_5m_df=get_5m(NAS100_LABEL),
     )
-except Exception as _nqe:
-    pass   # NQ silently degrades — not critical
+except Exception:
+    pass   # _nq_report stays None — render_nq_panel handles None gracefully
 
 # ── NAS100 COMPONENT BREADTH (15-min cache) ───────────────────────────────────
 try:
@@ -613,10 +613,24 @@ except Exception as _mse:
 
 # ── NQ FUTURES PANEL ──────────────────────────────────────────────────────────
 try:
+    if _nq_report is None:
+        # get_nq_report raised before returning — create a safe unavailable report
+        from nq_futures import NQReport as _NQReport
+        _nq_report = _NQReport(
+            price=None, volume=None, leadership=None,
+            displacement=None, basis=None, score=None,
+            fetched_at=pd.Timestamp.now().strftime("%H:%M:%S"),
+            available=False,
+        )
     qqq_intraday_for_nq = _qqq_report_ms.intraday if _qqq_report_ms else None
     render_nq_panel(_nq_report, qqq_intraday=qqq_intraday_for_nq)
 except Exception as _nqre:
-    st.warning(f"NQ panel error: {_nqre}")
+    st.subheader("📊 NQ Futures vs QQQ — Institutional Confirmation Engine")
+    st.info(
+        "NQ Futures data unavailable — market may be closed or "
+        "NQ=F not accessible via yfinance at this time. "
+        "All other dashboard signals remain active."
+    )
 
 st.divider()
 
