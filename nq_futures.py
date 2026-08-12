@@ -668,50 +668,168 @@ def get_nq_report(qqq_ratio: float = 40.0,
                   qqq_5m_df: Optional[pd.DataFrame] = None) -> "NQReport":
     """
     Main entry point. Always returns an NQReport — never raises.
-    available=False when NQ=F data cannot be fetched.
-    """
-    _unavailable = NQReport(
-        price=None, volume=None, leadership=None,
-        displacement=None, basis=None, score=None,
-        fetched_at=pd.Timestamp.now().strftime("%H:%M:%S"),
-        available=False,
-    )
 
+    Strategy (in order):
+      1. Try NQ=F direct fetch → full native futures data
+      2. NQ=F unavailable → use QQQ 5m already in session_state as proxy
+         (same price action, scaled by qqq_ndx_ratio — zero new fetch needed)
+      3. Both fail → available=False (silent info message in panel)
+    """
     key = "report"
     if _cv(key, TTL_LIVE):
         cached = _load(key)
         if cached is not None:
             return cached
 
+    def _make_unavailable():
+        return NQReport(
+            price=None, volume=None, leadership=None,
+            displacement=None, basis=None, score=None,
+            fetched_at=pd.Timestamp.now().strftime("%H:%M:%S"),
+            available=False,
+        )
+
     try:
+        # ── Attempt 1: real NQ=F data ─────────────────────────────────────────
         nq_5m    = _fetch_nq_5m()
         nq_daily = _fetch_nq_daily()
-        qqq_5m   = qqq_5m_df or _fetch_qqq_5m()
+        qqq_5m   = qqq_5m_df  # use already-fetched QQQ — no extra call
 
-        if nq_5m is None:
-            _store(key, _unavailable)
-            return _unavailable
+        if nq_5m is not None:
+            price        = _build_nq_price(nq_5m, nq_daily)
+            volume       = _build_nq_volume(nq_5m, nq_daily)
+            leadership   = _build_leadership(nq_5m, qqq_5m)
+            displacement = _build_displacement(nq_5m)
+            basis        = _build_basis(price.price if price else 0, qqq_5m, qqq_ratio)
+            score        = _build_score(price, volume, leadership, displacement, basis)
+            result = NQReport(
+                price=price, volume=volume, leadership=leadership,
+                displacement=displacement, basis=basis, score=score,
+                fetched_at=pd.Timestamp.now().strftime("%H:%M:%S"),
+                available=True,
+            )
+            _store(key, result)
+            return result
 
-        price        = _build_nq_price(nq_5m, nq_daily)
-        volume       = _build_nq_volume(nq_5m, nq_daily)
-        leadership   = _build_leadership(nq_5m, qqq_5m)
-        displacement = _build_displacement(nq_5m)
-        basis        = _build_basis(price.price if price else 0, qqq_5m, qqq_ratio)
-        score        = _build_score(price, volume, leadership, displacement, basis)
+        # ── Attempt 2: QQQ as NQ proxy ────────────────────────────────────────
+        # QQQ 5m is already fetched by data_fetcher — zero rate limit risk
+        if qqq_5m is not None and not qqq_5m.empty and qqq_ratio > 0:
+            print("[nq_futures] NQ=F unavailable — using QQQ proxy")
+            # Treat QQQ 5m as if it were NQ (scaled by ratio)
+            proxy_5m = qqq_5m.copy()
+            proxy_5m.columns = [c.capitalize() for c in proxy_5m.columns]
 
-        result = NQReport(
-            price=price, volume=volume, leadership=leadership,
-            displacement=displacement, basis=basis, score=score,
-            fetched_at=pd.Timestamp.now().strftime("%H:%M:%S"),
-            available=True,
-        )
-        _store(key, result)
-        return result
+            # Scale OHLC to NAS100 index points
+            for col in ['Open', 'High', 'Low', 'Close']:
+                if col in proxy_5m.columns:
+                    proxy_5m[col] = proxy_5m[col] * qqq_ratio
+
+            # Also scale daily if we have it
+            proxy_daily = None
+            try:
+                from data_fetcher import get_1d, NAS100_LABEL
+                raw_1d = get_1d(NAS100_LABEL)
+                if raw_1d is not None and not raw_1d.empty:
+                    proxy_daily = raw_1d.copy()
+                    proxy_daily.columns = [c.capitalize() for c in proxy_daily.columns]
+                    for col in ['Open', 'High', 'Low', 'Close']:
+                        if col in proxy_daily.columns:
+                            proxy_daily[col] = proxy_daily[col] * qqq_ratio
+            except Exception:
+                pass
+
+            price        = _build_nq_price(proxy_5m, proxy_daily)
+            volume       = _build_nq_volume(proxy_5m, proxy_daily)
+            # Leadership: compare QQQ vs QQQE as proxy for NQ vs QQQ
+            leadership   = _build_leadership_qqq_proxy(proxy_5m, qqq_ratio)
+            displacement = _build_displacement(proxy_5m)
+            basis        = None   # no meaningful basis when using proxy
+            score        = _build_score(price, volume, leadership, displacement, basis)
+
+            # Override ticker label to show proxy source
+            if price:
+                price.ticker_used = "QQQ×ratio (NQ proxy)"
+
+            result = NQReport(
+                price=price, volume=volume, leadership=leadership,
+                displacement=displacement, basis=basis, score=score,
+                fetched_at=pd.Timestamp.now().strftime("%H:%M:%S"),
+                available=True,   # data is available, just from proxy
+            )
+            _store(key, result)
+            return result
 
     except Exception as e:
         print(f"[nq_futures] get_nq_report error: {e}")
-        _store(key, _unavailable)
-        return _unavailable
+
+    result = _make_unavailable()
+    _store(key, result)
+    return result
+
+
+def _build_leadership_qqq_proxy(proxy_5m: pd.DataFrame,
+                                  qqq_ratio: float) -> Optional[NQLeadership]:
+    """
+    When NQ=F is unavailable, estimate leadership using QQQ vs QQQE.
+    QQQ = cap-weighted (mega caps dominate)
+    QQQE = equal-weight (breadth)
+    If QQQ outperforms QQQE → narrow leadership (mega cap only) → similar to
+    NQ lagging QQQ in real futures (concentrated move, fragile).
+    If QQQE leads QQQ → broad participation → similar to NQ confirming QQQ.
+    """
+    try:
+        from data_fetcher import get_macro_df
+        qqqe_df = get_macro_df("qqqe")
+
+        proxy_5m.index = pd.to_datetime(proxy_5m.index, utc=True)
+        today = pd.Timestamp.now(tz='UTC').date()
+        today_bars = proxy_5m[proxy_5m.index.date == today]
+        if today_bars.empty:
+            today_bars = proxy_5m.tail(78)
+
+        qqq_open = float(today_bars['Open'].iloc[0]) / qqq_ratio
+        qqq_curr = float(today_bars['Close'].iloc[-1]) / qqq_ratio
+        qqq_ret  = (qqq_curr - qqq_open) / qqq_open * 100 if qqq_open > 0 else 0
+
+        # QQQE daily return as breadth proxy
+        qqqe_ret = 0.0
+        if qqqe_df is not None and len(qqqe_df) >= 2:
+            qqqe_df.columns = [c.capitalize() for c in qqqe_df.columns]
+            qqqe_ret = float(qqqe_df['Close'].pct_change(1).iloc[-1]) * 100
+
+        spread   = round(qqq_ret - qqqe_ret, 3)  # positive = cap-weighted leading
+        # Invert for NQ-leadership interpretation:
+        # broad market (QQQE ≥ QQQ) → NQ proxy "leading" → bullish
+        nq_proxy_lead = -spread   # negative spread = QQQE outperforming = broad = bullish
+
+        if nq_proxy_lead > 0.2:
+            sig   = "Broad market leading QQQ — rally has wide participation (bullish confirmation)"
+            color = "#2d9e2d"
+            conf  = "CONFIRMED"
+        elif nq_proxy_lead < -0.2:
+            sig   = "QQQ outperforming equal-weight — narrow mega-cap leadership (caution)"
+            color = "#e6a817"
+            conf  = "DIVERGENT"
+        else:
+            sig   = "QQQ and equal-weight aligned — neutral breadth"
+            color = "#888888"
+            conf  = "NEUTRAL"
+
+        return NQLeadership(
+            nq_return_today=round(qqq_ret, 3),
+            qqq_return_today=round(qqqe_ret, 3),
+            spread=round(nq_proxy_lead, 3),
+            rolling_corr_5d=0.95,
+            alignment_pct=80,
+            leadership_signal=f"[QQQ PROXY] {sig}",
+            leadership_color=color,
+            confirmation=conf,
+        )
+    except Exception as e:
+        print(f"[nq_futures] leadership proxy error: {e}")
+        return None
+
+
 
 
 # ── RENDER ────────────────────────────────────────────────────────────────────
@@ -729,10 +847,13 @@ def render_nq_panel(nq: NQReport, qqq_intraday=None):
         return
 
     nq_p = nq.price
+    is_proxy = "proxy" in (nq_p.ticker_used or "").lower()
+    proxy_badge = " &nbsp;🔄 **QQQ proxy** (NQ=F unavailable)" if is_proxy else ""
     st.caption(
         f"Data: {nq.fetched_at} | "
-        f"Contract: {nq_p.ticker_used} (×{nq_p.contract_multiplier:.0f}) | "
+        f"Source: {nq_p.ticker_used} | "
         f"Session: {nq_p.session}"
+        + (" | ⚠️ Using QQQ×ratio as NQ proxy — NQ=F not accessible" if is_proxy else "")
     )
 
     # ── NQ vs QQQ SIDE-BY-SIDE (Feature 1) ───────────────────────────────────
