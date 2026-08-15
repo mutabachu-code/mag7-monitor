@@ -111,10 +111,14 @@ class QQQIntraday:
     vwap_dev_pct: float
     volume_today: int
     avg_volume_20d: int
-    vol_surge_ratio: float
-    vol_signal: str             # "UNUSUAL HIGH" | "ELEVATED" | "NORMAL" | "LOW"
+    vol_surge_ratio: float      # session-adjusted pace ratio (primary)
+    vol_ratio_raw: float        # raw today_total / 20d_avg
+    vol_pace_ratio: float       # today_vol / expected_by_now (time-adjusted)
+    vol_accel: float            # late bars / early bars acceleration
+    vol_signal: str
     vol_signal_color: str
     dollar_volume_today: float  # price × volume (billions)
+    session_frac: float         # 0-1, how far through NY session
     bars_5m: Optional[pd.DataFrame] = None   # raw 5m data for charting
 
 
@@ -286,21 +290,78 @@ def _fetch_intraday() -> Optional[QQQIntraday]:
         # Volume
         vol_today = int(today_bars['Volume'].sum())
         avg_20d   = int(df_1d['Volume'].tail(20).mean()) if df_1d is not None and len(df_1d) >= 20 else vol_today
-        vol_ratio = vol_today / avg_20d if avg_20d > 0 else 1.0
+        vol_ratio_raw = vol_today / avg_20d if avg_20d > 0 else 1.0
         dollar_vol = curr_p * vol_today / 1e9  # billions
 
-        if vol_ratio >= 2.0:
-            vol_sig   = "🔴 UNUSUAL HIGH — Institutional activity"
-            vol_color = "#c9302c"
-        elif vol_ratio >= 1.5:
-            vol_sig   = "🟠 ELEVATED — Watch for breakout/breakdown"
-            vol_color = "#e6a817"
-        elif vol_ratio >= 0.8:
-            vol_sig   = "🟢 NORMAL"
-            vol_color = "#2d9e2d"
+        # ── FIX 1: Session-time-adjusted benchmark ────────────────────────────
+        # Compare vol to what's EXPECTED by this point in the session
+        # NY session = 09:30-16:00 ET = 13:30-20:00 UTC = 6.5h = 78 bars
+        utc_now      = pd.Timestamp.now(tz='UTC')
+        ny_open_utc  = utc_now.replace(hour=13, minute=30, second=0, microsecond=0)
+        ny_close_utc = utc_now.replace(hour=20, minute=0,  second=0, microsecond=0)
+        session_elapsed = max(0.0, (utc_now - ny_open_utc).total_seconds() / 3600)
+        session_total   = 6.5  # hours
+        session_frac    = min(session_elapsed / session_total, 1.0) if session_elapsed > 0 else 1.0
+
+        # Expected volume by this time of day
+        expected_by_now = avg_20d * session_frac if session_frac > 0.05 else avg_20d
+        pace_ratio      = vol_today / expected_by_now if expected_by_now > 0 else vol_ratio_raw
+
+        # ── FIX 2: Volume acceleration (last 6 bars vs previous 6) ────────────
+        vol_accel = 1.0
+        if len(today_bars) >= 12:
+            early_bars = today_bars['Volume'].iloc[-12:-6].mean()
+            late_bars  = today_bars['Volume'].iloc[-6:].mean()
+            vol_accel  = late_bars / early_bars if early_bars > 0 else 1.0
+
+        # ── FIX 3: Volume × Price direction matrix ────────────────────────────
+        price_rising = change_pct > 0.1   # up on the day
+        price_flat   = abs(change_pct) <= 0.1
+        price_falling= change_pct < -0.1
+        vol_building = pace_ratio >= 1.15 or vol_accel >= 1.3  # accelerating
+
+        # Classification — pace_ratio is the primary measure
+        if pace_ratio >= 2.0:
+            if price_rising:
+                vol_sig   = "🟢 ACCUMULATION — Unusual volume + rising price. Institutional buying. Chase."
+                vol_color = "#1a7a1a"
+            else:
+                vol_sig   = "🔴 DISTRIBUTION — Unusual volume + falling price. Institutional selling."
+                vol_color = "#8b0000"
+        elif pace_ratio >= 1.4:
+            if price_rising:
+                vol_sig   = "🟢 ELEVATED + Rising — Volume building into rally. Conviction confirmed."
+                vol_color = "#2d9e2d"
+            elif price_falling:
+                vol_sig   = "🟠 ELEVATED + Falling — Volume building into decline. Distribution."
+                vol_color = "#c9302c"
+            else:
+                vol_sig   = "🟠 ELEVATED — Above-pace volume. Watch for directional break."
+                vol_color = "#e6a817"
+        elif pace_ratio >= 0.85:
+            if vol_accel >= 1.4 and price_rising:
+                vol_sig   = "🟡 ACCELERATING — Volume pace picking up into rally. Momentum building."
+                vol_color = "#e6a817"
+            elif vol_accel >= 1.4 and price_falling:
+                vol_sig   = "🟡 ACCELERATING — Volume picking up into decline. Watch for continuation."
+                vol_color = "#e6a817"
+            else:
+                vol_sig   = "🟢 ON PACE — Normal session volume."
+                vol_color = "#2d9e2d"
         else:
-            vol_sig   = "⚪ LOW — Thin participation"
-            vol_color = "#888888"
+            # Below pace — but is price moving anyway?
+            if price_rising:
+                vol_sig   = "⚪ LOW CONVICTION RALLY — Price rising on below-pace volume. Fade at resistance."
+                vol_color = "#888888"
+            elif price_falling:
+                vol_sig   = "🟡 LOW VOLUME DECLINE — Sellers not committing. Possible exhaustion / bounce."
+                vol_color = "#e6a817"
+            else:
+                vol_sig   = "⚪ THIN — Below-pace volume. Wait for catalyst."
+                vol_color = "#888888"
+
+        # Use pace_ratio as the primary surge ratio (more accurate than raw ratio)
+        vol_surge_display = pace_ratio
 
         result = QQQIntraday(
             current_price=round(curr_p, 2),
@@ -316,10 +377,14 @@ def _fetch_intraday() -> Optional[QQQIntraday]:
             vwap_dev_pct=round(vwap_dev, 2),
             volume_today=vol_today,
             avg_volume_20d=avg_20d,
-            vol_surge_ratio=round(vol_ratio, 2),
+            vol_surge_ratio=round(vol_surge_display, 2),
+            vol_ratio_raw=round(vol_ratio_raw, 2),
+            vol_pace_ratio=round(pace_ratio, 2),
+            vol_accel=round(vol_accel, 2),
             vol_signal=vol_sig,
             vol_signal_color=vol_color,
             dollar_volume_today=round(dollar_vol, 2),
+            session_frac=round(session_frac, 2),
             bars_5m=today_bars,
         )
         _store(key, result)
@@ -870,20 +935,33 @@ def render_qqq_intelligence(report: QQQReport, selected_expiry: int = 0):
                       delta_color="normal" if iv.price_vs_vwap == "ABOVE" else "inverse")
 
             st.markdown("---")
-            v1, v2, v3, v4 = st.columns(4)
+            v1, v2, v3, v4, v5 = st.columns(5)
             v1.metric("Volume Today",    f"{iv.volume_today/1e6:.1f}M")
-            v2.metric("20d Avg Volume",  f"{iv.avg_volume_20d/1e6:.1f}M")
-            v3.metric("Vol Surge",       f"{iv.vol_surge_ratio:.2f}x",
-                      delta="High" if iv.vol_surge_ratio > 1.5 else "Normal",
-                      delta_color="off")
-            v4.metric("Dollar Volume",   f"${iv.dollar_volume_today:.1f}B")
+            v2.metric("20d Avg Full Day",f"{iv.avg_volume_20d/1e6:.1f}M")
 
+            # Session-adjusted pace — the key fix
+            pace_col = ("normal" if iv.vol_pace_ratio >= 0.85 else "inverse")
+            v3.metric("Pace Ratio",
+                      f"{iv.vol_pace_ratio:.2f}×",
+                      delta=f"{'On pace' if iv.vol_pace_ratio >= 0.85 else 'Below pace'} "
+                            f"({iv.session_frac*100:.0f}% thru session)",
+                      delta_color=pace_col)
+
+            # Acceleration
+            accel_delta = f"{'↑ Accelerating' if iv.vol_accel >= 1.3 else ('↓ Decelerating' if iv.vol_accel < 0.8 else 'Steady')}"
+            v4.metric("Vol Acceleration", f"{iv.vol_accel:.2f}×", delta=accel_delta)
+            v5.metric("Dollar Volume",   f"${iv.dollar_volume_today:.1f}B")
+
+            # Volume signal banner
             st.markdown(
                 f"<div style='padding:8px 12px;border-radius:6px;"
                 f"background:{iv.vol_signal_color}22;"
                 f"border-left:3px solid {iv.vol_signal_color};margin-top:8px'>"
                 f"<span style='color:{iv.vol_signal_color};font-weight:bold'>"
-                f"{iv.vol_signal}</span></div>",
+                f"{iv.vol_signal}</span>"
+                f"<span style='color:#888;font-size:0.82em;margin-left:12px'>"
+                f"Raw ratio: {iv.vol_ratio_raw:.2f}× 20d avg</span>"
+                f"</div>",
                 unsafe_allow_html=True,
             )
 
