@@ -286,10 +286,28 @@ def _extract_sources(
             if skew > 4:    sc -= 3; detail_parts.append(f"Skew +{skew:.1f}% bearish")
         if qqq_report.intraday:
             iv2 = qqq_report.intraday
-            if iv2.vol_surge_ratio >= 2.0 and iv2.change_pct < -0.3:
-                sc -= 6; sig = "SHORT"; detail_parts.append("Unusual vol DOWN — distribution")
-            elif iv2.vol_surge_ratio >= 1.5 and iv2.change_pct > 0.3:
-                sc += 4; sig = "LONG"; detail_parts.append("Unusual vol UP — accumulation")
+            pace = getattr(iv2, 'vol_pace_ratio', iv2.vol_surge_ratio)
+            accel = getattr(iv2, 'vol_accel', 1.0)
+            chg   = iv2.change_pct
+
+            if pace >= 1.4 and chg > 0.2:
+                sc += 6; sig = "LONG"
+                detail_parts.append(f"ACCUMULATION {pace:.1f}× pace + rising")
+            elif pace >= 1.4 and chg < -0.2:
+                sc -= 6; sig = "SHORT"
+                detail_parts.append(f"DISTRIBUTION {pace:.1f}× pace + falling")
+            elif accel >= 1.3 and chg > 0.1:
+                sc += 4; sig = "LONG"
+                detail_parts.append(f"Vol accelerating {accel:.1f}× into rally")
+            elif accel >= 1.3 and chg < -0.1:
+                sc -= 4; sig = "SHORT"
+                detail_parts.append(f"Vol accelerating {accel:.1f}× into decline")
+            elif pace < 0.75 and chg > 0.2:
+                sc -= 2  # low conviction rally — don't chase
+                detail_parts.append(f"Low-vol rally (pace {pace:.2f}×) — low conviction")
+            elif pace < 0.75 and chg < -0.2:
+                sc += 1  # low vol decline = sellers not committed
+                detail_parts.append(f"Low-vol decline — possible exhaustion")
         sources.append(SourceSignal(
             source="QQQ Intelligence", signal=sig,
             detail=" | ".join(detail_parts) or "QQQ normal",
