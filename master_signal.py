@@ -449,7 +449,7 @@ def _score_qqq_options(qqq_report) -> LayerScore:
 
     # ── QQQ VOLUME SIGNAL ─────────────────────────────────────────────────────
     if iv:
-        vr = iv.vol_surge_ratio
+        vr = iv.vol_pace_ratio
         if vr >= 2.0 and iv.change_pct < -0.5:
             # High volume sell-off = institutional distribution
             score -= 8
@@ -608,18 +608,48 @@ def _resolve_conflicts(
             if conviction == "STRONG":
                 new_conv = "MODERATE"
 
-        # ── C5: Unusual volume DOWN + LONG ────────────────────────────────────
-        if (direction == "LONG" and qqq_report.intraday
-                and qqq_report.intraday.vol_surge_ratio >= 2.0
-                and qqq_report.intraday.change_pct < -0.5):
-            blockers.append(
-                f"QQQ distribution signal: unusual volume "
-                f"({qqq_report.intraday.vol_surge_ratio:.1f}× average) "
-                f"on a {qqq_report.intraday.change_pct:.1f}% decline — "
-                "institutional selling. No long entries."
-            )
-            new_dir  = "HOLD"
-            new_conv = "AVOID"
+        # ── C5: Vol-Price matrix signals ──────────────────────────────────────
+        if qqq_report.intraday:
+            iv_c5 = qqq_report.intraday
+            pace  = getattr(iv_c5, 'vol_pace_ratio', iv_c5.vol_surge_ratio)
+            accel = getattr(iv_c5, 'vol_accel', 1.0)
+            chg   = iv_c5.change_pct
+
+            # Distribution: elevated vol + falling price + LONG signal → block
+            if direction == "LONG" and pace >= 1.4 and chg < -0.3:
+                blockers.append(
+                    f"QQQ distribution: volume pace {pace:.1f}× "
+                    f"on a {chg:.1f}% decline — institutional selling. "
+                    "No long entries."
+                )
+                new_dir  = "HOLD"
+                new_conv = "AVOID"
+
+            # Accumulation: elevated vol + rising price → confirm LONG, warn SHORT
+            elif direction == "SHORT" and pace >= 1.4 and chg > 0.3:
+                warnings.append(
+                    f"QQQ accumulation: volume pace {pace:.1f}× "
+                    f"on a +{chg:.1f}% rally — shorting into institutional buying."
+                )
+                if new_conv == "STRONG":
+                    new_conv = "MODERATE"
+
+            # Low conviction rally: low vol + rising price → warn not to chase
+            elif direction == "LONG" and pace < 0.75 and chg > 0.2:
+                warnings.append(
+                    f"Low-conviction rally: vol only {pace:.2f}× session pace "
+                    f"on +{chg:.1f}% move. Fade at resistance, don't chase."
+                )
+
+            # Accelerating vol into move
+            elif accel >= 1.4 and pace >= 0.85:
+                if chg > 0.1 and direction == "LONG":
+                    pass   # confirmation — no warning needed
+                elif chg < -0.1 and direction == "LONG":
+                    warnings.append(
+                        f"Volume accelerating {accel:.1f}× into decline — "
+                        "momentum building to the downside."
+                    )
 
     # ── C6: LONG + LOW breadth + bearish IV skew ──────────────────────────────
     if direction == "LONG" and breadth_quality and breadth_quality.quality_label == "LOW":
