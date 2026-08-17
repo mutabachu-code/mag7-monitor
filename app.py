@@ -27,6 +27,7 @@ from nas100_breadth import (
 from qqq_intelligence import get_qqq_report, render_qqq_intelligence
 from nq_futures import get_nq_report, render_nq_panel
 from final_signal import compute_unified_signal, render_unified_signal
+from order_flow_sequence import compute_order_flow_sequence, render_order_flow_sequence
 
 # ── SETUP ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Mag 7 + NAS100 Monitor", layout="wide")
@@ -926,6 +927,16 @@ if _nas_5m is not None and nas_ind:
                     st.caption(cpr.setup_description)
                 else:
                     st.caption("No active CPR signal at current price.")
+
+        # ── ORDER FLOW SEQUENCE (additive) ──────────────────────────────────
+        st.markdown("---")
+        try:
+            _ofs = compute_order_flow_sequence(
+                _nas_5m, _nas_scalp.cpr, _nas_price, ratio=_nas_ratio,
+            )
+            render_order_flow_sequence(_ofs)
+        except Exception as _ofse:
+            st.caption(f"Order flow sequence unavailable: {_ofse}")
 
     except Exception as _se:
         st.warning(f"NAS100 scalping unavailable: {_se}")
