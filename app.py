@@ -933,6 +933,7 @@ if _nas_5m is not None and nas_ind:
         try:
             _ofs = compute_order_flow_sequence(
                 _nas_5m, _nas_scalp.cpr, _nas_price, ratio=_nas_ratio,
+                scalp_report=_nas_scalp,
             )
             render_order_flow_sequence(_ofs)
         except Exception as _ofse:
