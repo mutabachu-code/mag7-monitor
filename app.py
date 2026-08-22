@@ -28,6 +28,7 @@ from qqq_intelligence import get_qqq_report, render_qqq_intelligence
 from nq_futures import get_nq_report, render_nq_panel
 from final_signal import compute_unified_signal, render_unified_signal
 from order_flow_sequence import compute_order_flow_sequence, render_order_flow_sequence
+from mean_reversion_atr import compute_mean_reversion_setup, render_mean_reversion_setup
 
 # ── SETUP ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Mag 7 + NAS100 Monitor", layout="wide")
@@ -554,6 +555,25 @@ if _nas_5m_early is not None and nas_ind:
     except Exception:
         pass
 
+# ── ORDER FLOW SEQUENCE + ATR MEAN REVERSION (feed Layers 8 & 9 below) ────────
+_ofs_ms = None
+_mr_ms  = None
+if _nas_5m_early is not None and nas_ind:
+    try:
+        _ofs_ms = compute_order_flow_sequence(
+            _nas_5m_early, _scalp_for_ms.cpr if _scalp_for_ms else None,
+            float(nas_ind['curr_p']), ratio=_nas_ratio_ms, scalp_report=_scalp_for_ms,
+        )
+    except Exception:
+        pass
+    try:
+        _mr_ms = compute_mean_reversion_setup(
+            _nas_5m_early, _ofs_ms, _scalp_for_ms,
+            float(nas_ind['curr_p']), ratio=_nas_ratio_ms,
+        )
+    except Exception:
+        pass
+
 _nas_price_ms = float(nas_ind['curr_p']) if nas_ind else None
 _gex_ms       = None
 _heatmap_ms   = None
@@ -608,6 +628,8 @@ try:
         scalp_report=_scalp_for_ms,
         qqq_report=_qqq_report_ms,
         nq_report=_nq_report,
+        ofs=_ofs_ms,
+        mr_setup=_mr_ms,
     )
 except Exception as _mse:
     pass   # master signal feeds unified — failure degrades gracefully
@@ -938,6 +960,17 @@ if _nas_5m is not None and nas_ind:
             render_order_flow_sequence(_ofs)
         except Exception as _ofse:
             st.caption(f"Order flow sequence unavailable: {_ofse}")
+            _ofs = None
+
+        # ── ATR MEAN REVERSION (additive) ────────────────────────────────────
+        st.markdown("---")
+        try:
+            _mr = compute_mean_reversion_setup(
+                _nas_5m, _ofs, _nas_scalp, _nas_price, ratio=_nas_ratio,
+            )
+            render_mean_reversion_setup(_mr)
+        except Exception as _mre:
+            st.caption(f"Mean reversion setup unavailable: {_mre}")
 
     except Exception as _se:
         st.warning(f"NAS100 scalping unavailable: {_se}")
