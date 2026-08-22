@@ -13,8 +13,12 @@ Signal layers (weighted):
   Layer 3 — Options Intelligence(25 pts max)  GEX regime, OI walls, expected move
   Layer 4 — Breadth Quality     (15 pts max)  semi leadership, mag7 participation
   Layer 5 — Technical / Price   (25 pts max)  SMA200, MACD, RSI, vol surge, signal
+  Layer 6 — QQQ Options+Vol     (15 pts max)  PCR, IV skew, unusual options activity
+  Layer 7 — NQ Futures          (15 pts max)  NQ/QQQ leadership, VWAP slope confirmation
+  Layer 8 — Order Flow Sequence (12 pts max)  4-stage delta/liquidity-zone footprint sequence
+  Layer 9 — Mean Reversion(ATR) (13 pts max)  ATR-extension fade, order-flow + RSI confirmed
 
-Total possible: 100 pts (bullish) or -100 pts (bearish)
+Total possible: 155 raw pts, scaled to ±100
 
 Output:
   • MASTER DIRECTION:  LONG | SHORT | HOLD
@@ -526,6 +530,56 @@ def _score_nq_futures(nq_report) -> LayerScore:
                       " | ".join(details[:2]))
 
 
+def _score_order_flow_sequence(ofs) -> LayerScore:
+    """
+    Layer 8: Order Flow Sequence — max ±12 pts.
+    Reads the OrderFlowSequence from order_flow_sequence.py (duck-typed, no
+    import needed — same pattern as every other layer here). The sequence
+    only models the bearish→bullish footprint explicitly (selling pressure →
+    absorption → seller exhaustion → reversal confirmed), so this layer is
+    asymmetric by design: it can argue for LONG with real conviction, but
+    only ever argues mildly against SHORT via unresolved selling pressure.
+    """
+    if ofs is None or ofs.stage == "NEUTRAL":
+        return LayerScore("Order Flow Sequence", 0, 12, "Neutral",
+                          "No clear order-flow sequence forming" if ofs else "Unavailable")
+
+    weight = {"HIGH": 1.0, "MEDIUM": 0.6, "LOW": 0.25}.get(ofs.confidence, 0.25)
+    base = {
+        "SELLING_PRESSURE":  -8,
+        "ABSORPTION":         3,   # ambiguous — sellers losing effectiveness, not yet confirmed reversal
+        "SELLER_EXHAUSTION":  7,
+        "REVERSAL_CONFIRMED": 10,
+    }.get(ofs.stage, 0)
+
+    score = int(round(base * weight))
+    score = max(-12, min(12, score))
+    verdict = "Bullish" if score > 3 else ("Bearish" if score < -3 else "Neutral")
+    detail = f"{ofs.stage.replace('_',' ').title()} ({ofs.confidence.lower()} confidence)"
+    return LayerScore("Order Flow Sequence", score, 12, verdict, detail)
+
+
+def _score_mean_reversion(mr) -> LayerScore:
+    """
+    Layer 9: ATR Mean Reversion — max ±13 pts.
+    Reads the MeanReversionSetup from mean_reversion_atr.py (duck-typed).
+    Only contributes when a setup is `valid` — i.e. extension trigger met,
+    confluence-count confirmed, and R:R clears the module's min_rr floor.
+    An extended-but-unconfirmed reading (valid=False) scores 0, same as no
+    setup at all — extension alone isn't evidence.
+    """
+    if mr is None or not mr.valid or mr.direction is None:
+        detail = mr.description[:110] if mr is not None else "Unavailable"
+        return LayerScore("Mean Reversion (ATR)", 0, 13, "No Setup", detail)
+
+    magnitude = 13 if mr.confidence == "HIGH" else 8   # valid setups are MEDIUM or HIGH by construction
+    score = magnitude if mr.direction == "LONG" else -magnitude
+    verdict = "Bullish" if score > 0 else "Bearish"
+    detail = (f"{mr.direction} fade at {mr.extension_atr:+.1f} ATR from {mr.anchor_label} "
+              f"(R:R {mr.risk_reward_1:.1f}, {mr.confidence.lower()} confidence)")
+    return LayerScore("Mean Reversion (ATR)", score, 13, verdict, detail)
+
+
 def _resolve_conflicts(
     direction: str,
     conviction: str,
@@ -860,6 +914,8 @@ def compute_master_signal(
     scalp_report,
     qqq_report=None,        # from get_qqq_report()
     nq_report=None,         # from get_nq_report() — Layer 7
+    ofs=None,                # OrderFlowSequence from order_flow_sequence.py — Layer 8
+    mr_setup=None,           # MeanReversionSetup from mean_reversion_atr.py — Layer 9
 ) -> Optional["MasterSignal"]:
     """
     Aggregate all dashboard signals into one Master Signal.
@@ -885,13 +941,15 @@ def compute_master_signal(
     l5              = _score_technicals(ind)
     l6              = _score_qqq_options(qqq_report)   # Layer 6
     l7              = _score_nq_futures(nq_report)      # Layer 7
+    l8              = _score_order_flow_sequence(ofs)   # Layer 8
+    l9              = _score_mean_reversion(mr_setup)   # Layer 9
 
-    layers      = [l1, l2, l3, l4, l5, l6, l7]
-    total_score = sum(l.score for l in layers)   # ±130 max
+    layers      = [l1, l2, l3, l4, l5, l6, l7, l8, l9]
+    total_score = sum(l.score for l in layers)   # ±155 max
 
     # ── INITIAL DIRECTION & CONVICTION ───────────────────────────────────────
-    # Scale score to ±100 range (total_score can be ±115 with 6 layers)
-    scaled_score = int(total_score * 100 / 130)
+    # Scale score to ±100 range (total_score can be ±155 with 9 layers)
+    scaled_score = int(total_score * 100 / 155)
     blockers = []
     warnings = []
 
