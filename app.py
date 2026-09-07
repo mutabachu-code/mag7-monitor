@@ -284,6 +284,17 @@ def compute_indicators(label: str):
     try:
         last_bar_time = pd.to_datetime(df_5m.index[-1], utc=True)
         bar_age_mins  = int((pd.Timestamp.now(tz='UTC') - last_bar_time).total_seconds() / 60)
+        # If bar is >120 min old, the entire session_state cache is stale
+        # Purge it so next refresh forces a real fetch (fixes the 3545min bug)
+        if bar_age_mins > 120 and label == NAS100_LABEL:
+            keys_to_clear = [k for k in st.session_state.keys()
+                             if any(k.startswith(p) for p in
+                                    ['df_5m_', 'df_1h_', 'df_1d_', 'oi_', 'gex_',
+                                     'expected_move', 'nq_', 'qqq_', 'ii_'])]
+            for k in keys_to_clear:
+                del st.session_state[k]
+            st.session_state["last_good_fetch_ts"] = 0
+            print(f"[app] Purged {len(keys_to_clear)} stale cache keys (bar was {bar_age_mins}min old)")
     except Exception:
         pass
 
@@ -390,7 +401,13 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
         )
         # Bar age warning — tells user when data is stale vs TradingView
         bar_age = ind.get('bar_age_mins', 0)
-        if bar_age >= 8:
+        if bar_age > 120:
+            st.error(
+                f"🔴 DATA FROZEN: Last bar is {bar_age}min old. "
+                "yfinance is blocked or rate-limited. "
+                "**Fix: Go to Manage app → Reboot app** on Streamlit Cloud."
+            )
+        elif bar_age >= 8:
             st.caption(f"⚠️ Last bar: {bar_age}min ago — may lag TradingView by ~{bar_age}min")
         elif bar_age >= 5:
             st.caption(f"🕐 Last bar: {bar_age}min ago")
