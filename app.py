@@ -33,7 +33,9 @@ from final_signal import compute_unified_signal, render_unified_signal
 # ── SETUP ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Mag 7 + NAS100 Monitor", layout="wide")
 init_risk_state()
-st_autorefresh(interval=60000, key="datarefresh")
+# 30s refresh — reduces price staleness (was 60s)
+# Pro plan handles the load; free plan should use 60000
+st_autorefresh(interval=30000, key="datarefresh")
 
 risk_config = RiskConfig(
     account_size_usd=100.0,
@@ -79,7 +81,6 @@ def get_bs_delta(S, K, T, r, sigma):
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     return norm.cdf(d1)
 
-
 # ── DATA FETCH ────────────────────────────────────────────────────────────────
 import time as _time
 fetch_start = _time.time()
@@ -87,16 +88,34 @@ with st.spinner("Fetching market data..."):
     data_ok = fetch_all_data()
 fetch_elapsed = _time.time() - fetch_start
 
+# Track last successful fetch time for staleness display
+if data_ok:
+    st.session_state["last_good_fetch_ts"] = _time.time()
+    st.session_state["last_good_fetch_str"] = pd.Timestamp.now().strftime("%H:%M:%S")
+
+last_good_fetch = st.session_state.get("last_good_fetch_ts", 0)
+data_age_secs   = int(_time.time() - last_good_fetch) if last_good_fetch else 999
+
 if not data_ok:
     has_stale = any(
         st.session_state.get(f"df_5m_{t}") is not None
         for t in ([NAS100_LABEL] + MAG7)
     )
     if has_stale:
-        st.warning("⚠️ Live fetch failed — showing last known prices. Retrying next refresh.")
+        age_str = f"{data_age_secs}s ago" if data_age_secs < 300 else f"{data_age_secs//60}min ago"
+        st.warning(
+            f"⚠️ Live fetch failed — showing cached prices from {age_str}. "
+            f"Price may differ from TradingView. Retrying next refresh (30s)."
+        )
     else:
         st.error("⚠️ No market data available. Market may be closed or yfinance is rate-limited.")
         st.stop()
+elif data_age_secs > 120:
+    # Data fetched but taking too long — warn about potential staleness
+    st.warning(
+        f"⚠️ Data last refreshed {data_age_secs}s ago — prices may lag TradingView by "
+        f"up to {data_age_secs + 300}s due to yfinance 5m bar delay."
+    )
 elif fetch_elapsed > 15:
     st.caption(f"⏱️ Data loaded in {fetch_elapsed:.0f}s")
 
@@ -422,6 +441,60 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
                         f"Risk Score: {macro.risk_score}/100 — {macro.risk_level}"
                     ) if macro else "unavailable"
 
+                    # ── ENHANCED CONTEXT FOR CLAUDE (upgraded) ────────────────
+                    # Options Reaction Engine context
+                    ore_context = "unavailable"
+                    if _ore_ms:
+                        pw = _ore_ms.put_wall
+                        cw = _ore_ms.call_wall
+                        ore_context = (
+                            f"GEX: {_ore_ms.gamma_regime} | "
+                            f"Gamma flip: {_ore_ms.gamma_flip:,.0f} | "
+                            f"Put wall: {pw.strike:,.0f} quality={pw.wall_quality}/100 "
+                            f"rejection={pw.rejection_prob:.0f}% status={pw.status} | "
+                            f"Call wall: {cw.strike:,.0f} quality={cw.wall_quality}/100 "
+                            f"rejection={cw.rejection_prob:.0f}% status={cw.status} | "
+                            f"Signal: {_ore_ms.reaction_signal[:80]}"
+                        ) if pw and cw else f"GEX: {_ore_ms.gamma_regime}"
+
+                    # CPR context
+                    cpr_context = "unavailable"
+                    if _scalp_for_ms and _scalp_for_ms.cpr:
+                        cpr = _scalp_for_ms.cpr
+                        cpr_context = (
+                            f"{cpr.cpr_type} CPR | TC:{cpr.tc:,.0f} BC:{cpr.bc:,.0f} "
+                            f"Pivot:{cpr.pivot:,.0f} | Position:{cpr.price_vs_cpr} | "
+                            + (cpr.setup.description[:60] if cpr.setup else "No setup")
+                        )
+
+                    # NQ Futures context
+                    nq_context = "unavailable"
+                    if _nq_report and _nq_report.available and _nq_report.score:
+                        nqs = _nq_report.score
+                        lead = _nq_report.leadership.leadership_signal[:60] if _nq_report.leadership else ""
+                        nq_context = (
+                            f"NQ score {nqs.score}/100 ({nqs.direction_bias}) | {lead}"
+                        )
+
+                    # Breadth quality context
+                    bq_context = "unavailable"
+                    if _breadth_quality:
+                        bq = _breadth_quality
+                        bq_context = (
+                            f"Breadth {bq.quality_label} ({bq.quality_score}/100) | "
+                            f"Semi: {bq.semi_leadership.signal if bq.semi_leadership else 'N/A'} | "
+                            f"Mag7 {bq.mag7_participation.participation_pct:.0f}% above SMA20"
+                            if bq.mag7_participation else ""
+                        )
+
+                    # Unified signal context
+                    unified_context = "unavailable"
+                    if '_unified' in dir() and _unified:
+                        unified_context = (
+                            f"{_unified.overall_direction} | Score:{_unified.overall_score:+d} | "
+                            f"Confidence:{_unified.confidence_pct}%"
+                        )
+
                     ai = analyse(
                         ticker=ind["label"],
                         current_price=ind["curr_p"],
@@ -436,6 +509,11 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
                         lot_size=effective_lot,
                         implied_volatility=iv_str,
                         macro_context=macro_context,
+                        options_context=ore_context,
+                        cpr_context=cpr_context,
+                        nq_context=nq_context,
+                        breadth_context=bq_context,
+                        unified_signal=unified_context,
                     )
 
                     if ai is None:
@@ -447,8 +525,26 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
                             f"| Confidence: **{ai.confidence}**"
                         )
                         st.caption(f"📊 {ai.reasoning}")
+
+                        # Win rate assessment — new v3 field
+                        if ai.win_rate_assessment:
+                            wr_color = ("#2d9e2d" if "HIGH" in ai.win_rate_assessment
+                                        else "#e6a817" if "MODERATE" in ai.win_rate_assessment
+                                        else "#c9302c")
+                            st.markdown(
+                                f"<div style='padding:5px 10px;border-radius:5px;"
+                                f"background:{wr_color}22;border-left:2px solid {wr_color};"
+                                f"font-size:0.85em;color:{wr_color}'>"
+                                f"🎯 {ai.win_rate_assessment}</div>",
+                                unsafe_allow_html=True,
+                            )
+
                         if ai.sentiment_summary:
                             st.info(f"🗞️ {ai.sentiment_summary}")
+
+                        # Key risk — new v3 field
+                        if ai.key_risk and ai.action != "HOLD":
+                            st.warning(f"⚠️ Key risk: {ai.key_risk}")
 
                         if ai.action != "HOLD":
                             c1, c2, c3 = st.columns(3)
