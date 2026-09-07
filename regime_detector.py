@@ -156,37 +156,58 @@ def _compute_breadth_score(breadth_ratio: Optional[float],
                             risk_score: Optional[int]) -> int:
     """
     Returns score 0-100. High = broad healthy participation.
-
-    BUG 4 FIX: Recalibrated thresholds for %-gap inputs.
-    Also reads breadth_signal string directly as primary source.
+    Floor: never returns below 20 to prevent false CHOP regime pre-market.
     """
     score = 50   # neutral baseline
 
-    # Primary: use the signal string (more reliable than raw ratio)
-    if breadth_signal:
-        if "EXHAUSTION" in breadth_signal:
-            score = 10
-        elif "DIVERGING" in breadth_signal:
-            score = 35
-        elif "HEALTHY" in breadth_signal:
+    # Primary: use the signal string
+    if breadth_signal and isinstance(breadth_signal, str):
+        sig_upper = breadth_signal.upper()
+        if "EXHAUSTION" in sig_upper:
+            score = 25   # was 10 — raised floor to prevent false CHOP
+        elif "DIVERGING" in sig_upper:
+            score = 40   # was 35
+        elif "HEALTHY" in sig_upper:
             score = 80
-        # else keep 50
+        # else keep 50 (Narrow, unknown, pre-market)
 
     # Secondary: fine-tune with ratio if available
-    # breadth_ratio = QQQ_5d_ret - QQQE_5d_ret (percentage points)
     elif breadth_ratio is not None:
         gap = abs(breadth_ratio)
-        if gap < 0.8:    score = 80   # was <1.0 — tightened
-        elif gap < 2.5:  score = 55   # was <2.5 kept
-        elif gap < 4.0:  score = 30   # was <4.0 kept
-        else:            score = 10
+        if gap < 0.8:    score = 80
+        elif gap < 2.5:  score = 55
+        elif gap < 4.0:  score = 35
+        else:            score = 25
 
-    # Macro risk score adjustment
+    # Macro risk score adjustment — capped to prevent 0 floor
     if risk_score is not None:
-        if risk_score >= 70:   score = max(score - 40, 0)
-        elif risk_score >= 40: score = max(score - 20, 0)
+        if risk_score >= 70:   score = max(score - 25, 20)   # was -40 → min 0
+        elif risk_score >= 40: score = max(score - 10, 20)   # was -20
 
     return score
+
+
+def _compute_regime_state(vol_score: int, trend_score: int,
+                           breadth_score: int, macro_risk_score: Optional[int],
+                           risk_off: bool) -> int:
+    """
+    Determine regime state with improved logic:
+    CHOP only fires if BOTH vol AND (trend OR breadth) are weak.
+    Prevents pre-market low breadth from triggering CHOP when trend is strong.
+    """
+    if vol_score >= 45 or risk_off or (macro_risk_score or 0) >= 70:
+        return 2   # CRISIS
+
+    # CHOP: requires vol_score >= 25 OR (trend weak AND breadth weak)
+    # Prevents: low vol pre-market + low breadth → false CHOP
+    if vol_score >= 25:
+        return 1   # elevated vol → CHOP
+    if trend_score < 40 and breadth_score < 40:
+        return 1   # both weak → CHOP
+    if trend_score < 30:
+        return 1   # very weak trend → CHOP
+
+    return 0   # TRENDING
 
 
 def _check_risk_off(gold_df, jpy_df, tnx_df) -> tuple:
@@ -268,10 +289,11 @@ def detect_regime_stocks(
 
     trend_live = "BULLISH" if trend_bullish else "BEARISH"
 
-    # ── REGIME CLASSIFICATION ─────────────────────────────────────────────
-    # BUG 5 FIX: State 2 threshold lowered to 45 (was 55)
-    if vol_score >= 45 or risk_off or (macro_risk_score or 0) >= 70:
-        state   = 2
+    # ── REGIME CLASSIFICATION — improved state logic ─────────────────────
+    state = _compute_regime_state(vol_score, trend_score, breadth_score,
+                                   macro_risk_score, risk_off)
+
+    if state == 2:
         label   = "HIGH VOLATILITY / CRISIS"
         color   = "#8b0000"
         icon    = "🔴"
@@ -285,9 +307,7 @@ def detect_regime_stocks(
         )
         conf = min((vol_score / 100) + (0.3 if risk_off else 0), 1.0)
 
-    elif (vol_score >= 25 or trend_score < 40 or breadth_score < 40
-          or (macro_risk_score or 0) >= 40):
-        state   = 1
+    elif state == 1:
         label   = "SIDEWAYS / CHOP"
         color   = "#e6a817"
         icon    = "🟡"
@@ -300,7 +320,6 @@ def detect_regime_stocks(
         conf = 0.5 + (vol_score / 200)
 
     else:
-        state   = 0
         label   = "QUIET TREND"
         color   = "#2d9e2d"
         icon    = "🟢"
