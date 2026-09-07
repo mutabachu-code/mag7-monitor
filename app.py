@@ -16,7 +16,9 @@ from risk_manager import RiskConfig, init_risk_state, render_risk_sidebar, check
 # ── NEW ENGINES ───────────────────────────────────────────────────────────────
 from options_intelligence import (
     get_oi_heatmap, get_gex, get_expected_move,
+    get_options_reaction_engine, compute_cpr_oi_confluence,
     render_oi_heatmap, render_gex_panel, render_expected_move_panel,
+    render_options_reaction_engine,
 )
 from breadth_quality import get_breadth_quality, render_breadth_quality_panel
 from master_signal import compute_master_signal, render_master_signal
@@ -27,8 +29,6 @@ from nas100_breadth import (
 from qqq_intelligence import get_qqq_report, render_qqq_intelligence
 from nq_futures import get_nq_report, render_nq_panel
 from final_signal import compute_unified_signal, render_unified_signal
-from order_flow_sequence import compute_order_flow_sequence, render_order_flow_sequence
-from mean_reversion_atr import compute_mean_reversion_setup, render_mean_reversion_setup
 
 # ── SETUP ─────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Mag 7 + NAS100 Monitor", layout="wide")
@@ -555,29 +555,11 @@ if _nas_5m_early is not None and nas_ind:
     except Exception:
         pass
 
-# ── ORDER FLOW SEQUENCE + ATR MEAN REVERSION (feed Layers 8 & 9 below) ────────
-_ofs_ms = None
-_mr_ms  = None
-if _nas_5m_early is not None and nas_ind:
-    try:
-        _ofs_ms = compute_order_flow_sequence(
-            _nas_5m_early, _scalp_for_ms.cpr if _scalp_for_ms else None,
-            float(nas_ind['curr_p']), ratio=_nas_ratio_ms, scalp_report=_scalp_for_ms,
-        )
-    except Exception:
-        pass
-    try:
-        _mr_ms = compute_mean_reversion_setup(
-            _nas_5m_early, _ofs_ms, _scalp_for_ms,
-            float(nas_ind['curr_p']), ratio=_nas_ratio_ms,
-        )
-    except Exception:
-        pass
-
 _nas_price_ms = float(nas_ind['curr_p']) if nas_ind else None
 _gex_ms       = None
 _heatmap_ms   = None
 _em_ms        = None
+_ore_ms       = None   # Options Reaction Engine
 if _nas_price_ms:
     try:
         _gex_ms     = get_gex(_nas_price_ms, _nas_ratio_ms)
@@ -586,7 +568,29 @@ if _nas_price_ms:
                        if _nas_5m_early is not None and len(_nas_5m_early) > 0
                        else _nas_price_ms)
         _em_ms      = get_expected_move(_nas_price_ms, _open_ms, _nas_ratio_ms)
-    except Exception:
+
+        # Options Reaction Engine — needs GEX regime + macro context
+        _gex_regime_for_ore = _gex_ms.gamma_regime if _gex_ms else "NEGATIVE"
+        _gamma_flip_for_ore = _gex_ms.gamma_flip_price if _gex_ms else 0.0
+        _yield_10y_for_ore  = (_macro_snap.yield_10y if _macro_snap
+                                and hasattr(_macro_snap, 'yield_10y') else 4.5)
+        _semi_weak  = (_breadth_quality.semi_leadership.signal == "LAGGING"
+                       if _breadth_quality and _breadth_quality.semi_leadership else False)
+        _below_vwap = (nas_ind and _scalp_for_ms and _scalp_for_ms.vwap
+                       and float(nas_ind['curr_p']) < _scalp_for_ms.vwap)
+        _ore_ms = get_options_reaction_engine(
+            current_price_nas100=_nas_price_ms,
+            qqq_ratio=_nas_ratio_ms,
+            gex_regime=_gex_regime_for_ore,
+            gamma_flip=_gamma_flip_for_ore,
+            vix_value=vix_value,
+            yield_10y=_yield_10y_for_ore,
+            semi_weak=bool(_semi_weak),
+            below_vwap=bool(_below_vwap),
+            macro_snap=_macro_snap,
+        )
+    except Exception as _ore_err:
+        print(f"[app] Options fetch error: {_ore_err}")
         pass
 
 _master_sig = None
@@ -628,8 +632,7 @@ try:
         scalp_report=_scalp_for_ms,
         qqq_report=_qqq_report_ms,
         nq_report=_nq_report,
-        ofs=_ofs_ms,
-        mr_setup=_mr_ms,
+        ore=_ore_ms,
     )
 except Exception as _mse:
     pass   # master signal feeds unified — failure degrades gracefully
@@ -681,44 +684,57 @@ except Exception as _use:
 st.divider()
 
 if nas_ind:
-    st.subheader("🧮 Options Intelligence — NAS100")
     _nas_price = float(nas_ind['curr_p'])
     _nas_ratio = float(get_qqq_ndx_ratio() or 40.0)
 
-    oi_col, gex_col, em_col = st.columns(3)
+    # ── OPTIONS REACTION ENGINE (primary panel) ───────────────────────────────
+    try:
+        # Pass CPR if available for confluence detection
+        _cpr_for_ore = _scalp_for_ms.cpr if _scalp_for_ms else None
+        if _ore_ms:
+            # Attach CPR confluence
+            if _cpr_for_ore:
+                from options_intelligence import compute_cpr_oi_confluence
+                _ore_ms.cpr_confluence = compute_cpr_oi_confluence(_cpr_for_ore, _ore_ms)
+            render_options_reaction_engine(_ore_ms, cpr=_cpr_for_ore)
+        else:
+            # Fall back to old panels if ORE not ready
+            st.subheader("🧮 Options Intelligence — NAS100")
+            oi_col, gex_col, em_col = st.columns(3)
+            with oi_col:
+                _heatmap = _heatmap_ms or get_oi_heatmap(_nas_price, _nas_ratio)
+                if _heatmap:
+                    render_oi_heatmap(_heatmap)
+                else:
+                    st.caption("OI heatmap unavailable")
+            with gex_col:
+                _gex = _gex_ms or get_gex(_nas_price, _nas_ratio)
+                if _gex:
+                    render_gex_panel(_gex)
+            with em_col:
+                _em = _em_ms or get_expected_move(_nas_price, _nas_price, _nas_ratio)
+                if _em:
+                    render_expected_move_panel(_em)
+    except Exception as _ore_render_err:
+        st.warning(f"Options Reaction Engine error: {_ore_render_err}")
 
-    # OI Heatmap — reuse cached fetch from master signal
-    with oi_col:
-        try:
-            _heatmap = _heatmap_ms or get_oi_heatmap(_nas_price, _nas_ratio)
-            if _heatmap:
-                render_oi_heatmap(_heatmap)
-            else:
-                st.caption("OI heatmap unavailable (market closed or data error)")
-        except Exception as _e:
-            st.caption(f"OI heatmap error: {_e}")
-
-    # GEX — reuse cached fetch
-    with gex_col:
-        try:
-            _gex = _gex_ms or get_gex(_nas_price, _nas_ratio)
-            if _gex:
-                render_gex_panel(_gex)
-            else:
-                st.caption("GEX unavailable")
-        except Exception as _e:
-            st.caption(f"GEX error: {_e}")
-
-    # Expected Move — reuse cached fetch
-    with em_col:
-        try:
-            _em = _em_ms or get_expected_move(_nas_price, _nas_price, _nas_ratio)
-            if _em:
-                render_expected_move_panel(_em)
-            else:
-                st.caption("Expected move unavailable")
-        except Exception as _e:
-            st.caption(f"Expected move error: {_e}")
+    # ── DETAIL PANELS (collapsible — GEX + Expected Move always shown) ─────────
+    with st.expander("📊 GEX + Expected Move Detail", expanded=False):
+        d1, d2 = st.columns(2)
+        with d1:
+            try:
+                _gex = _gex_ms or get_gex(_nas_price, _nas_ratio)
+                if _gex:
+                    render_gex_panel(_gex)
+            except Exception:
+                pass
+        with d2:
+            try:
+                _em = _em_ms or get_expected_move(_nas_price, _nas_price, _nas_ratio)
+                if _em:
+                    render_expected_move_panel(_em)
+            except Exception:
+                pass
 
     st.divider()
 
@@ -949,28 +965,6 @@ if _nas_5m is not None and nas_ind:
                     st.caption(cpr.setup_description)
                 else:
                     st.caption("No active CPR signal at current price.")
-
-        # ── ORDER FLOW SEQUENCE (additive) ──────────────────────────────────
-        st.markdown("---")
-        try:
-            _ofs = compute_order_flow_sequence(
-                _nas_5m, _nas_scalp.cpr, _nas_price, ratio=_nas_ratio,
-                scalp_report=_nas_scalp,
-            )
-            render_order_flow_sequence(_ofs)
-        except Exception as _ofse:
-            st.caption(f"Order flow sequence unavailable: {_ofse}")
-            _ofs = None
-
-        # ── ATR MEAN REVERSION (additive) ────────────────────────────────────
-        st.markdown("---")
-        try:
-            _mr = compute_mean_reversion_setup(
-                _nas_5m, _ofs, _nas_scalp, _nas_price, ratio=_nas_ratio,
-            )
-            render_mean_reversion_setup(_mr)
-        except Exception as _mre:
-            st.caption(f"Mean reversion setup unavailable: {_mre}")
 
     except Exception as _se:
         st.warning(f"NAS100 scalping unavailable: {_se}")
