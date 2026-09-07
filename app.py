@@ -279,6 +279,14 @@ def compute_indicators(label: str):
     curr_p       = df_5m['Close'].iloc[-1]
     prev_p       = df_5m['Close'].iloc[-2]
 
+    # Data freshness: show how old the last bar is
+    bar_age_mins = 0
+    try:
+        last_bar_time = pd.to_datetime(df_5m.index[-1], utc=True)
+        bar_age_mins  = int((pd.Timestamp.now(tz='UTC') - last_bar_time).total_seconds() / 60)
+    except Exception:
+        pass
+
     if label == NAS100_LABEL:
         ratio     = get_qqq_ndx_ratio()
         curr_p    = round(curr_p    * ratio, 0)
@@ -368,6 +376,7 @@ def compute_indicators(label: str):
         sma200_1h=sma200_1h, trend_status=trend_status, trend_color=trend_color,
         macd_bullish=macd_bullish, rsi=rsi, vol_ratio=vol_ratio,
         delta_val=delta_val, signal=signal, sig_color=sig_color, iv=iv,
+        bar_age_mins=bar_age_mins,
     )
 
 
@@ -379,6 +388,12 @@ def render_ticker_card(ind: dict, col, risk_config: RiskConfig):
             value=f"${ind['curr_p']:,.2f}",
             delta=f"{ind['curr_p'] - ind['prev_p']:.2f}",
         )
+        # Bar age warning — tells user when data is stale vs TradingView
+        bar_age = ind.get('bar_age_mins', 0)
+        if bar_age >= 8:
+            st.caption(f"⚠️ Last bar: {bar_age}min ago — may lag TradingView by ~{bar_age}min")
+        elif bar_age >= 5:
+            st.caption(f"🕐 Last bar: {bar_age}min ago")
         st.markdown(f"**Trend (1H SMA200):** :{ind['trend_color']}[{ind['trend_status']}]")
         st.markdown(f"**Signal:** :{ind['sig_color']}[{ind['signal']}]")
 
@@ -785,52 +800,50 @@ if nas_ind:
 
     # ── OPTIONS REACTION ENGINE (primary panel) ───────────────────────────────
     try:
-        # Pass CPR if available for confluence detection
         _cpr_for_ore = _scalp_for_ms.cpr if _scalp_for_ms else None
         if _ore_ms:
-            # Attach CPR confluence
             if _cpr_for_ore:
                 from options_intelligence import compute_cpr_oi_confluence
                 _ore_ms.cpr_confluence = compute_cpr_oi_confluence(_cpr_for_ore, _ore_ms)
             render_options_reaction_engine(_ore_ms, cpr=_cpr_for_ore)
         else:
-            # Fall back to old panels if ORE not ready
+            # ORE not ready — show GEX + Expected Move which are always available
             st.subheader("🧮 Options Intelligence — NAS100")
-            oi_col, gex_col, em_col = st.columns(3)
-            with oi_col:
-                _heatmap = _heatmap_ms or get_oi_heatmap(_nas_price, _nas_ratio)
-                if _heatmap:
-                    render_oi_heatmap(_heatmap)
-                else:
-                    st.caption("OI heatmap unavailable")
+            st.info("🔥 Options Reaction Engine loading (fetching multi-expiry chains)... "
+                    "GEX and Expected Move shown below.")
+            gex_col, em_col = st.columns(2)
             with gex_col:
-                _gex = _gex_ms or get_gex(_nas_price, _nas_ratio)
+                _gex = _gex_ms
                 if _gex:
                     render_gex_panel(_gex)
+                else:
+                    st.caption("GEX: market closed or data unavailable")
             with em_col:
-                _em = _em_ms or get_expected_move(_nas_price, _nas_price, _nas_ratio)
+                _em = _em_ms
                 if _em:
                     render_expected_move_panel(_em)
+                else:
+                    st.caption("Expected move: market closed or data unavailable")
     except Exception as _ore_render_err:
-        st.warning(f"Options Reaction Engine error: {_ore_render_err}")
+        st.warning(f"Options panel error: {_ore_render_err}")
 
-    # ── DETAIL PANELS (collapsible — GEX + Expected Move always shown) ─────────
-    with st.expander("📊 GEX + Expected Move Detail", expanded=False):
-        d1, d2 = st.columns(2)
-        with d1:
-            try:
-                _gex = _gex_ms or get_gex(_nas_price, _nas_ratio)
-                if _gex:
-                    render_gex_panel(_gex)
-            except Exception:
-                pass
-        with d2:
-            try:
-                _em = _em_ms or get_expected_move(_nas_price, _nas_price, _nas_ratio)
-                if _em:
-                    render_expected_move_panel(_em)
-            except Exception:
-                pass
+    # ── DETAIL PANELS (always visible — GEX + Expected Move) ──────────────────
+    # Only show if ORE is active (avoid duplicate when ORE is loading)
+    if _ore_ms:
+        with st.expander("📊 GEX + Expected Move Detail", expanded=False):
+            d1, d2 = st.columns(2)
+            with d1:
+                try:
+                    if _gex_ms:
+                        render_gex_panel(_gex_ms)
+                except Exception:
+                    pass
+            with d2:
+                try:
+                    if _em_ms:
+                        render_expected_move_panel(_em_ms)
+                except Exception:
+                    pass
 
     st.divider()
 
