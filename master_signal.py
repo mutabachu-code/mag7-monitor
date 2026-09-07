@@ -13,12 +13,8 @@ Signal layers (weighted):
   Layer 3 — Options Intelligence(25 pts max)  GEX regime, OI walls, expected move
   Layer 4 — Breadth Quality     (15 pts max)  semi leadership, mag7 participation
   Layer 5 — Technical / Price   (25 pts max)  SMA200, MACD, RSI, vol surge, signal
-  Layer 6 — QQQ Options+Vol     (15 pts max)  PCR, IV skew, unusual options activity
-  Layer 7 — NQ Futures          (15 pts max)  NQ/QQQ leadership, VWAP slope confirmation
-  Layer 8 — Order Flow Sequence (12 pts max)  4-stage delta/liquidity-zone footprint sequence
-  Layer 9 — Mean Reversion(ATR) (13 pts max)  ATR-extension fade, order-flow + RSI confirmed
 
-Total possible: 155 raw pts, scaled to ±100
+Total possible: 100 pts (bullish) or -100 pts (bearish)
 
 Output:
   • MASTER DIRECTION:  LONG | SHORT | HOLD
@@ -201,9 +197,12 @@ def _score_regime(regime) -> LayerScore:
     return LayerScore("Regime", score, 15, verdict, detail)
 
 
-def _score_options(gex, heatmap, expected_move, current_price) -> tuple:
+def _score_options(gex, heatmap, expected_move, current_price,
+                    ore=None) -> tuple:
     """
     Layer 3: Options Intelligence — max ±25 pts.
+    v3: Uses OptionsReactionEngine wall quality + penetration probability
+    when available. Falls back to heatmap-based scoring if ORE not ready.
     Returns (LayerScore, oi_support, oi_resistance, gamma_flip, em_remaining)
     """
     score = 0
@@ -213,63 +212,99 @@ def _score_options(gex, heatmap, expected_move, current_price) -> tuple:
     gamma_flip    = None
     em_remaining  = 9999.0
 
-    if gex is None and heatmap is None and expected_move is None:
+    if gex is None and heatmap is None and expected_move is None and ore is None:
         return (LayerScore("Options Intelligence", 0, 25, "Unavailable",
                            "Options data not loaded"), None, None, None, em_remaining)
 
-    # GEX regime
+    # ── GEX regime ────────────────────────────────────────────────────────────
     if gex:
         gamma_flip = gex.gamma_flip_price
         if gex.gamma_regime == "POSITIVE":
             score += 5
             details.append("Positive GEX: mean-revert favored")
         else:
-            # Negative GEX amplifies the prevailing direction
-            # Determine if price is above or below gamma flip
             if current_price > gex.gamma_flip_price:
-                score += 8   # above flip in negative gamma = strong momentum up
+                score += 8
                 details.append(f"Above gamma flip ({gex.gamma_flip_price:,.0f}) — momentum UP")
             else:
                 score -= 8
                 details.append(f"Below gamma flip ({gex.gamma_flip_price:,.0f}) — momentum DOWN")
 
-    # OI walls — support/resistance relative to current price
-    if heatmap:
+    # ── ORE Wall Quality scoring (v3 upgrade) ─────────────────────────────────
+    if ore is not None:
+        oi_support    = ore.put_wall.strike  if ore.put_wall  else None
+        oi_resistance = ore.call_wall.strike if ore.call_wall else None
+
+        if ore.put_wall:
+            pw = ore.put_wall
+            # High quality put wall below price = strong support
+            if current_price > pw.strike:
+                wall_score = int((pw.wall_quality - 50) / 50 * 8)  # -8 to +8
+                score += wall_score
+                details.append(f"Put wall {pw.strike:,.0f} quality {pw.wall_quality}/100 "
+                                f"(rejection {pw.rejection_prob:.0f}%)")
+                # If wall is TESTING and high rejection prob = bullish bounce signal
+                if pw.status == "TESTING" and pw.rejection_prob >= 65:
+                    score += 4
+                    details.append(f"Put wall TESTING — bounce {pw.rejection_prob:.0f}% likely")
+                elif pw.status in ("FAILED", "BROKEN"):
+                    score -= 6
+                    details.append(f"Put wall {pw.status} — bearish")
+            else:
+                # Price below put wall = bearish
+                score -= 6
+                details.append(f"Price below put wall ({pw.strike:,.0f}) — bearish")
+
+        if ore.call_wall:
+            cw = ore.call_wall
+            if current_price < cw.strike:
+                # Below call wall = room to run
+                if cw.wall_quality >= 75:
+                    score += 2   # strong call wall = cap on upside
+                    details.append(f"Call wall {cw.strike:,.0f} strong cap ({cw.rejection_prob:.0f}% rejection)")
+                else:
+                    score += 4   # weak call wall = can break through
+                    details.append(f"Weak call wall {cw.strike:,.0f} — room to rally")
+            else:
+                # Above call wall = breakout or resistance flipped to support
+                if cw.status == "BROKEN":
+                    score += 5
+                    details.append(f"Call wall broken ({cw.strike:,.0f}) — momentum continues")
+                else:
+                    score -= 2
+                    details.append(f"Stalling above call wall {cw.strike:,.0f}")
+
+    # ── Fallback: heatmap-based scoring (when ORE not available) ──────────────
+    elif heatmap:
         oi_support    = heatmap.max_put_strike
         oi_resistance = heatmap.max_call_strike
-
         if current_price > heatmap.max_put_strike:
             score += 6
-            details.append(f"Above put wall ({heatmap.max_put_strike:,.0f}) = OI support below")
+            details.append(f"Above put wall ({heatmap.max_put_strike:,.0f})")
         else:
             score -= 6
-            details.append(f"Below put wall ({heatmap.max_put_strike:,.0f}) = bearish OI")
-
+            details.append(f"Below put wall ({heatmap.max_put_strike:,.0f})")
         if current_price < heatmap.max_call_strike:
             score += 3
-            details.append(f"Call wall ({heatmap.max_call_strike:,.0f}) overhead — room to run")
         else:
-            score -= 2   # above call wall = resistance flipped but next wall unknown
+            score -= 2
 
-    # Expected move
+    # ── Expected move ─────────────────────────────────────────────────────────
     if expected_move:
         exh = expected_move.exhaustion_pct
-        em_remaining = max(0.0, expected_move.expected_daily_move_pts - expected_move.actual_move_today_pts)
-
+        em_remaining = getattr(expected_move, 'expected_move_remaining_pts',
+                               max(0.0, expected_move.expected_daily_move_pts
+                                   - expected_move.actual_move_today_pts))
         if exh < 40:
-            score += 6
-            details.append(f"Only {exh:.0f}% of expected move used — full range ahead")
+            score += 6; details.append(f"Only {exh:.0f}% EM used — full range ahead")
         elif exh < 70:
-            score += 2
-            details.append(f"{exh:.0f}% of expected move used")
+            score += 2; details.append(f"{exh:.0f}% EM used")
         elif exh < 100:
-            score -= 4
-            details.append(f"⚠️ {exh:.0f}% of expected move used — approaching limit")
+            score -= 4; details.append(f"⚠️ {exh:.0f}% EM used")
         else:
-            score -= 10
-            details.append(f"🔴 Expected move exceeded ({exh:.0f}%) — reversal risk HIGH")
+            score -= 10; details.append(f"🔴 EM exceeded ({exh:.0f}%)")
 
-    score = max(-25, min(25, score))
+    score   = max(-25, min(25, score))
     verdict = "Bullish" if score > 8 else ("Bearish" if score < -8 else "Neutral")
     return (
         LayerScore("Options Intelligence", score, 25, verdict, " | ".join(details[:3])),
@@ -528,56 +563,6 @@ def _score_nq_futures(nq_report) -> LayerScore:
     verdict = "Bullish" if score > 4 else ("Bearish" if score < -4 else "Neutral")
     return LayerScore("NQ Futures", score, 15, verdict,
                       " | ".join(details[:2]))
-
-
-def _score_order_flow_sequence(ofs) -> LayerScore:
-    """
-    Layer 8: Order Flow Sequence — max ±12 pts.
-    Reads the OrderFlowSequence from order_flow_sequence.py (duck-typed, no
-    import needed — same pattern as every other layer here). The sequence
-    only models the bearish→bullish footprint explicitly (selling pressure →
-    absorption → seller exhaustion → reversal confirmed), so this layer is
-    asymmetric by design: it can argue for LONG with real conviction, but
-    only ever argues mildly against SHORT via unresolved selling pressure.
-    """
-    if ofs is None or ofs.stage == "NEUTRAL":
-        return LayerScore("Order Flow Sequence", 0, 12, "Neutral",
-                          "No clear order-flow sequence forming" if ofs else "Unavailable")
-
-    weight = {"HIGH": 1.0, "MEDIUM": 0.6, "LOW": 0.25}.get(ofs.confidence, 0.25)
-    base = {
-        "SELLING_PRESSURE":  -8,
-        "ABSORPTION":         3,   # ambiguous — sellers losing effectiveness, not yet confirmed reversal
-        "SELLER_EXHAUSTION":  7,
-        "REVERSAL_CONFIRMED": 10,
-    }.get(ofs.stage, 0)
-
-    score = int(round(base * weight))
-    score = max(-12, min(12, score))
-    verdict = "Bullish" if score > 3 else ("Bearish" if score < -3 else "Neutral")
-    detail = f"{ofs.stage.replace('_',' ').title()} ({ofs.confidence.lower()} confidence)"
-    return LayerScore("Order Flow Sequence", score, 12, verdict, detail)
-
-
-def _score_mean_reversion(mr) -> LayerScore:
-    """
-    Layer 9: ATR Mean Reversion — max ±13 pts.
-    Reads the MeanReversionSetup from mean_reversion_atr.py (duck-typed).
-    Only contributes when a setup is `valid` — i.e. extension trigger met,
-    confluence-count confirmed, and R:R clears the module's min_rr floor.
-    An extended-but-unconfirmed reading (valid=False) scores 0, same as no
-    setup at all — extension alone isn't evidence.
-    """
-    if mr is None or not mr.valid or mr.direction is None:
-        detail = mr.description[:110] if mr is not None else "Unavailable"
-        return LayerScore("Mean Reversion (ATR)", 0, 13, "No Setup", detail)
-
-    magnitude = 13 if mr.confidence == "HIGH" else 8   # valid setups are MEDIUM or HIGH by construction
-    score = magnitude if mr.direction == "LONG" else -magnitude
-    verdict = "Bullish" if score > 0 else "Bearish"
-    detail = (f"{mr.direction} fade at {mr.extension_atr:+.1f} ATR from {mr.anchor_label} "
-              f"(R:R {mr.risk_reward_1:.1f}, {mr.confidence.lower()} confidence)")
-    return LayerScore("Mean Reversion (ATR)", score, 13, verdict, detail)
 
 
 def _resolve_conflicts(
@@ -914,8 +899,7 @@ def compute_master_signal(
     scalp_report,
     qqq_report=None,        # from get_qqq_report()
     nq_report=None,         # from get_nq_report() — Layer 7
-    ofs=None,                # OrderFlowSequence from order_flow_sequence.py — Layer 8
-    mr_setup=None,           # MeanReversionSetup from mean_reversion_atr.py — Layer 9
+    ore=None,               # from get_options_reaction_engine() — upgrades Layer 3
 ) -> Optional["MasterSignal"]:
     """
     Aggregate all dashboard signals into one Master Signal.
@@ -935,21 +919,19 @@ def compute_master_signal(
     # ── SCORE EACH LAYER ─────────────────────────────────────────────────────
     l1              = _score_macro(macro_snap)
     l2              = _score_regime(regime)
-    l3_tuple        = _score_options(gex, heatmap, expected_move, current_price)
+    l3_tuple        = _score_options(gex, heatmap, expected_move, current_price, ore=ore)
     l3, oi_support, oi_resistance, gamma_flip, em_remaining = l3_tuple
     l4, lot_adj_bq  = _score_breadth(breadth_quality)
     l5              = _score_technicals(ind)
     l6              = _score_qqq_options(qqq_report)   # Layer 6
     l7              = _score_nq_futures(nq_report)      # Layer 7
-    l8              = _score_order_flow_sequence(ofs)   # Layer 8
-    l9              = _score_mean_reversion(mr_setup)   # Layer 9
 
-    layers      = [l1, l2, l3, l4, l5, l6, l7, l8, l9]
-    total_score = sum(l.score for l in layers)   # ±155 max
+    layers      = [l1, l2, l3, l4, l5, l6, l7]
+    total_score = sum(l.score for l in layers)   # ±130 max
 
     # ── INITIAL DIRECTION & CONVICTION ───────────────────────────────────────
-    # Scale score to ±100 range (total_score can be ±155 with 9 layers)
-    scaled_score = int(total_score * 100 / 155)
+    # Scale score to ±100 range (total_score can be ±115 with 6 layers)
+    scaled_score = int(total_score * 100 / 130)
     blockers = []
     warnings = []
 
