@@ -143,81 +143,120 @@ class OptionsReactionEngine:
 
 
 def _fetch_all_expiries(ticker_yf="QQQ"):
+    """
+    Fetch multiple expiry chains with timeout + fallback.
+    Uses threading to enforce a hard timeout — prevents page freeze.
+    Falls back to single nearest expiry if multi-fetch fails/times out.
+    """
     cache_key = f"oi_multi_{ticker_yf}"
     if _oi_cache_valid(cache_key):
         return _load_oi(cache_key)
-    try:
-        ticker = yf.Ticker(ticker_yf)
-        exps   = ticker.options
-        if not exps:
-            return None
-        today = pd.Timestamp.now()
-        target_dtes = [0, 2, 5, 14, 45, 90]
-        selected = []
-        for target in target_dtes:
-            best, best_diff = None, 9999
-            for e in exps:
-                diff = abs((pd.Timestamp(e) - today).days - target)
-                if diff < best_diff:
-                    best_diff, best = diff, e
-            if best and best not in selected:
-                selected.append(best)
-        chains = {}
-        for exp in selected[:6]:
-            try:
-                chain = ticker.option_chain(exp)
-                calls = chain.calls[['strike','openInterest','lastPrice',
-                                      'impliedVolatility','volume','bid','ask']].copy()
-                puts  = chain.puts[['strike','openInterest','lastPrice',
-                                     'impliedVolatility','volume','bid','ask']].copy()
-                calls.columns = ['strike','call_oi','call_price','call_iv','call_vol','call_bid','call_ask']
-                puts.columns  = ['strike','put_oi','put_price','put_iv','put_vol','put_bid','put_ask']
-                merged = pd.merge(calls, puts, on='strike', how='outer').fillna(0)
-                for col in ['call_oi','put_oi','call_vol','put_vol']:
-                    merged[col] = merged[col].astype(int)
-                merged['dte']    = int((pd.Timestamp(exp) - today).days)
-                merged['expiry'] = exp
-                chains[exp] = merged.sort_values('strike').reset_index(drop=True)
-            except Exception:
-                continue
-        if chains:
-            _store_oi(cache_key, chains)
-        return chains if chains else None
-    except Exception as e:
-        print(f"[options_intelligence] Multi-expiry fetch error: {e}")
+
+    import threading
+
+    result_holder = [None]
+    error_holder  = [None]
+
+    def _fetch():
+        try:
+            ticker = yf.Ticker(ticker_yf)
+            exps   = ticker.options
+            if not exps:
+                return
+            today = pd.Timestamp.now()
+            target_dtes = [0, 2, 5, 14, 45, 90]
+            selected = []
+            for target in target_dtes:
+                best, best_diff = None, 9999
+                for e in exps:
+                    diff = abs((pd.Timestamp(e) - today).days - target)
+                    if diff < best_diff:
+                        best_diff, best = diff, e
+                if best and best not in selected:
+                    selected.append(best)
+            chains = {}
+            for exp in selected[:4]:   # limit to 4 expiries to reduce fetch time
+                try:
+                    chain = ticker.option_chain(exp)
+                    calls = chain.calls[['strike','openInterest','lastPrice',
+                                          'impliedVolatility','volume','bid','ask']].copy()
+                    puts  = chain.puts[['strike','openInterest','lastPrice',
+                                         'impliedVolatility','volume','bid','ask']].copy()
+                    calls.columns = ['strike','call_oi','call_price','call_iv','call_vol','call_bid','call_ask']
+                    puts.columns  = ['strike','put_oi','put_price','put_iv','put_vol','put_bid','put_ask']
+                    merged = pd.merge(calls, puts, on='strike', how='outer').fillna(0)
+                    for col in ['call_oi','put_oi','call_vol','put_vol']:
+                        merged[col] = merged[col].astype(int)
+                    merged['dte']    = int((pd.Timestamp(exp) - today).days)
+                    merged['expiry'] = exp
+                    chains[exp] = merged.sort_values('strike').reset_index(drop=True)
+                except Exception:
+                    continue
+            result_holder[0] = chains if chains else None
+        except Exception as e:
+            error_holder[0] = str(e)
+
+    t = threading.Thread(target=_fetch, daemon=True)
+    t.start()
+    t.join(timeout=12)   # hard 12s timeout — never freeze the page
+
+    if t.is_alive():
+        print(f"[options_intelligence] Multi-expiry fetch timed out — using fallback")
+        # Fallback: use already-cached single-expiry if available
+        fallback = _load_oi(f"oi_chain_{ticker_yf}")
+        if fallback is not None and not fallback.empty:
+            return {"fallback": fallback}
         return None
+
+    chains = result_holder[0]
+    if chains:
+        _store_oi(cache_key, chains)
+    elif error_holder[0]:
+        print(f"[options_intelligence] Multi-expiry error: {error_holder[0]}")
+        # Return single-chain fallback
+        single = _fetch_options_chain(ticker_yf)
+        if single is not None:
+            return {"fallback": single}
+    return chains
 
 
 def _fetch_options_chain(ticker_yf="QQQ"):
+    """Single-expiry chain with 8s timeout — fallback for all engines."""
     cache_key = f"oi_chain_{ticker_yf}"
     if _oi_cache_valid(cache_key):
         return _load_oi(cache_key)
-    try:
-        ticker = yf.Ticker(ticker_yf)
-        exps   = ticker.options
-        if not exps:
-            return None
-        today = pd.Timestamp.now()
-        valid = [e for e in exps if (pd.Timestamp(e) - today).days >= 0]
-        exp   = valid[0] if valid else exps[0]
-        chain = ticker.option_chain(exp)
-        calls = chain.calls[['strike','openInterest','lastPrice',
-                              'impliedVolatility','volume','bid','ask']].copy()
-        puts  = chain.puts[['strike','openInterest','lastPrice',
-                             'impliedVolatility','volume','bid','ask']].copy()
-        calls.columns = ['strike','call_oi','call_price','call_iv','call_vol','call_bid','call_ask']
-        puts.columns  = ['strike','put_oi','put_price','put_iv','put_vol','put_bid','put_ask']
-        merged = pd.merge(calls, puts, on='strike', how='outer').fillna(0)
-        for col in ['call_oi','put_oi','call_vol','put_vol']:
-            merged[col] = merged[col].astype(int)
-        merged['dte']    = int((pd.Timestamp(exp) - today).days)
-        merged['expiry'] = exp
-        merged = merged.sort_values('strike').reset_index(drop=True)
-        _store_oi(cache_key, merged)
-        return merged
-    except Exception as e:
-        print(f"[options_intelligence] Chain fetch error: {e}")
-        return None
+    import threading
+    result = [None]
+    def _fetch():
+        try:
+            ticker = yf.Ticker(ticker_yf)
+            exps   = ticker.options
+            if not exps:
+                return
+            today = pd.Timestamp.now()
+            valid = [e for e in exps if (pd.Timestamp(e) - today).days >= 0]
+            exp   = valid[0] if valid else exps[0]
+            chain = ticker.option_chain(exp)
+            calls = chain.calls[['strike','openInterest','lastPrice',
+                                  'impliedVolatility','volume','bid','ask']].copy()
+            puts  = chain.puts[['strike','openInterest','lastPrice',
+                                 'impliedVolatility','volume','bid','ask']].copy()
+            calls.columns = ['strike','call_oi','call_price','call_iv','call_vol','call_bid','call_ask']
+            puts.columns  = ['strike','put_oi','put_price','put_iv','put_vol','put_bid','put_ask']
+            merged = pd.merge(calls, puts, on='strike', how='outer').fillna(0)
+            for col in ['call_oi','put_oi','call_vol','put_vol']:
+                merged[col] = merged[col].astype(int)
+            merged['dte']    = int((pd.Timestamp(exp) - today).days)
+            merged['expiry'] = exp
+            result[0] = merged.sort_values('strike').reset_index(drop=True)
+        except Exception as e:
+            print(f"[options_intelligence] Chain fetch error: {e}")
+    t = threading.Thread(target=_fetch, daemon=True)
+    t.start()
+    t.join(timeout=8)
+    if result[0] is not None:
+        _store_oi(cache_key, result[0])
+    return result[0]
 
 
 def _approx_greeks(strike, spot, dte, iv, is_call):
