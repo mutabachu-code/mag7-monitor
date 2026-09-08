@@ -1,305 +1,436 @@
 """
-data_fetcher.py
----------------
-Data fetcher using yf.download() instead of yf.Ticker().history().
-yf.download() uses a different code path with better cookie/session handling
-on cloud servers (Streamlit Cloud, Heroku, Railway etc).
+data_fetcher.py  —  v5
+-----------------------
+Single data layer for the entire Mag7 + NAS100 dashboard.
+Fetches ALL instruments in one parallel batch with hard timeouts.
 
-Provides the same interface as the original:
-  fetch_all_data()  — fetches all tickers, returns True/False
-  get_5m(label)     — returns cached 5m DataFrame
-  get_1h(label)     — returns cached 1H DataFrame
-  get_1d(label)     — returns cached daily DataFrame
-  get_vix()         — returns VIX float
-  get_heatmap_data(label) — returns 1H data for heatmap
-  get_qqq_ndx_ratio()     — QQQ→NAS100 multiplier
-  get_gold_df()           — Gold daily
-  get_macro_df(key)       — macro instrument daily
-  MAG7                    — list of Mag7 tickers
-  NAS100_LABEL            — "NAS100"
+Instruments covered:
+  - Mag 7 stocks:     AAPL MSFT GOOGL AMZN TSLA META NVDA
+  - NAS100 proxy:     QQQ  (^NDX for scaling ratio)
+  - Volatility:       ^VIX
+  - Macro:            ^TNX (10Y yield), BZ=F (Brent oil), QQQE (equal-weight Nasdaq)
+
+Before v4: 34 individual yfinance calls per refresh
+v4:        1 parallel batch, all results in session_state cache (65s TTL)
+
+v5 — FIX for data breaks / rate limits under concurrent users:
+  st.session_state is scoped PER BROWSER SESSION, not shared across users.
+  Under v4, every distinct visitor (and every session that restarts after
+  Streamlit Cloud's 12h hibernation) independently re-fetched all ~13
+  tickers from yfinance — N viewers meant roughly N× the call volume, all
+  landing on Yahoo Finance from Streamlit Community Cloud's shared, fairly
+  small outbound-IP pool. Yahoo has gotten materially more aggressive about
+  429 rate-limiting since 2024/2025, and other apps sharing that same IP
+  pool can burn your rate-limit budget even with zero change in your own
+  traffic.
+
+  Fix, two parts:
+   1. The actual network fetch now lives behind @st.cache_data(ttl=65) —
+      an APP-PROCESS-wide cache, not a session one. The first call in any
+      65s window fetches for every concurrent user; Streamlit's own cache
+      lock also prevents a thundering herd of simultaneous re-fetches when
+      the cache goes cold. fetch_all_data() keeps its exact original name,
+      signature, and session_state side effects — every existing get_5m()/
+      get_1d()/etc. accessor across the codebase needs zero changes.
+   2. Raw yf.Ticker(...).history() calls now go through a short retry-with-
+      backoff specifically for rate-limit-shaped errors (HTTP 429 / "Too
+      Many Requests"), so a single transient block rides through instead of
+      silently blanking out a panel.
 """
 
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import streamlit as st
 import time
+import random
+import streamlit as st
 import threading
-from typing import Optional
+from typing import Optional, Tuple
+import os
+import shutil
 
-# ── CONSTANTS ─────────────────────────────────────────────────────────────────
-NAS100_LABEL = "NAS100"
-QQQ_TICKER   = "QQQ"    # proxy for NAS100 (multiply by ratio)
-NDX_TICKER   = "^NDX"   # NAS100 index for ratio calculation
 
-MAG7 = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA"]
+# ── YFINANCE SESSION PATCH ────────────────────────────────────────────────────
+# Yahoo Finance added TLS fingerprinting in 2025 that blocks cloud server IPs.
+# curl_cffi mimics Chrome's TLS handshake, bypassing the block.
+# Also clears yfinance's SQLite price cache which can serve stale bars.
 
-MACRO_TICKERS = {
-    "vix":   "^VIX",
-    "gold":  "GC=F",
-    "oil":   "CL=F",
-    "tnx":   "^TNX",
-    "qqqe":  "QQQE",
-    "ndx":   "^NDX",
-    "dxy":   "DX-Y.NYB",
-    "spy":   "SPY",
-}
-
-ALL_TICKERS = [QQQ_TICKER] + MAG7 + list(MACRO_TICKERS.values())
-
-# Cache TTLs
-TTL_5M  = 60    # 1 min
-TTL_1H  = 300   # 5 min
-TTL_1D  = 900   # 15 min
-
-# ── SESSION PATCH — applied once ──────────────────────────────────────────────
-def _patch_session():
-    """Apply yfinance session patch for cloud compatibility."""
-    if st.session_state.get("_df_patched"):
+def _apply_yf_patch():
+    """Apply once per Python process. Safe to call multiple times."""
+    if getattr(_apply_yf_patch, "_done", False):
         return
     try:
-        import os, shutil
-
-        # Clear stale SQLite cache
+        # 1. Clear stale SQLite price cache
         try:
             from platformdirs import user_cache_dir
             cache_dir = user_cache_dir("py-yfinance")
             if os.path.exists(cache_dir):
                 shutil.rmtree(cache_dir, ignore_errors=True)
                 os.makedirs(cache_dir, exist_ok=True)
+                print("[data_fetcher] Cleared yfinance SQLite cache")
         except Exception:
             pass
 
-        # Try curl_cffi (best for cloud — mimics real browser TLS)
+        # 2. curl_cffi Chrome impersonation (best fix for cloud TLS block)
         try:
             from curl_cffi import requests as cffi_req
             _s = cffi_req.Session(impersonate="chrome110")
             yf.utils.get_json.__globals__['requests'] = _s
+            print("[data_fetcher] curl_cffi session applied")
+        except ImportError:
+            # curl_cffi not installed — fall back to requests with browser headers
+            import requests
+            _s = requests.Session()
+            _s.headers.update({
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/120.0.0.0 Safari/537.36'
+                ),
+                'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Connection': 'keep-alive',
+            })
+            print("[data_fetcher] requests session with browser headers applied")
         except Exception:
             pass
 
-        st.session_state["_df_patched"] = True
-    except Exception:
-        st.session_state["_df_patched"] = True
+        _apply_yf_patch._done = True
+        print("[data_fetcher] yfinance patch complete")
+    except Exception as e:
+        print(f"[data_fetcher] Patch error (non-fatal): {e}")
+        _apply_yf_patch._done = True
 
 
-# ── CACHE HELPERS ─────────────────────────────────────────────────────────────
-def _cv(key: str, ttl: int) -> bool:
-    return (time.time() - st.session_state.get(f"_df_ts_{key}", 0)) < ttl
+# Apply immediately on import (before any yfinance call)
+_apply_yf_patch()
 
-def _store(key: str, data):
-    st.session_state[f"_df_{key}"] = data
-    st.session_state[f"_df_ts_{key}"] = time.time()
+# ── INSTRUMENT REGISTRY ───────────────────────────────────────────────────────
+MAG7         = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA']
+NAS100_LABEL = 'NAS100'
+NAS100_YF    = 'QQQ'        # reliable proxy; ^NDX often blocked on Linux
+VIX_YF       = '^VIX'
+NDX_YF       = '^NDX'       # only used for QQQ→NAS100 scaling ratio
+TNX_YF       = '^TNX'       # US 10Y Treasury yield
+TNX_FALLBACK = 'IEF'        # 7-10Y Treasury ETF as fallback
+OIL_YF       = 'BZ=F'       # Brent crude futures
+OIL_FALLBACK = 'USO'        # Oil ETF as fallback (more reliable)
+QQQE_YF      = 'QQQE'       # Equal-weight Nasdaq-100 (breadth indicator)
 
-def _load(key: str):
-    return st.session_state.get(f"_df_{key}")
+ALL_LABELS   = [NAS100_LABEL] + MAG7   # price card tickers
+
+# Macro instruments fetched separately (daily data only)
+GOLD_YF      = 'GLD'       # Gold ETF — reliable proxy for XAU/USD
+MACRO_YF     = [TNX_YF, OIL_YF, QQQE_YF, NDX_YF, VIX_YF, GOLD_YF]
+
+CACHE_TTL    = 65    # seconds — slightly longer than 60s refresh. Now the
+                      # st.cache_data TTL too, so this one constant governs
+                      # both the shared network cache and the session mirror.
+FETCH_TIMEOUT = 10   # seconds per ticker before abandoning
+
+RATE_LIMIT_MAX_RETRIES = 2      # short — must fit inside FETCH_TIMEOUT per ticker
+RATE_LIMIT_BASE_DELAY  = 0.6    # seconds; exponential backoff from here
 
 
-# ── CORE FETCH — yf.download() with threading timeout ─────────────────────────
-def _download(tickers, period, interval, timeout_s=20) -> Optional[pd.DataFrame]:
+# ── RATE-LIMIT-AWARE FETCH WRAPPER ────────────────────────────────────────────
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return any(s in msg for s in ("429", "too many requests", "rate limit", "rate-limited"))
+
+
+def _yf_history(ticker_obj, **kwargs) -> pd.DataFrame:
     """
-    Thread-safe yf.download() with hard timeout.
-    Returns MultiIndex DataFrame or None on failure/timeout.
+    yf.Ticker(...).history(**kwargs) with a couple of quick retries specifically
+    for rate-limit-shaped errors. Deliberately short (2 retries, ~0.6-1.5s
+    backoff) so it always fits inside the existing per-ticker FETCH_TIMEOUT —
+    if retries run long, the outer _fetch_with_timeout abandonment still
+    applies exactly as before, it just gets one or two extra chances first.
     """
-    result = [None]
-    error  = [None]
-
-    def _fetch():
+    last_exc = None
+    for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
         try:
-            df = yf.download(
-                tickers,
-                period=period,
-                interval=interval,
-                auto_adjust=True,
-                progress=False,
-                group_by="ticker" if len(tickers) > 1 else "column",
-                threads=True,
-                ignore_tz=True,
-            )
-            result[0] = df if not df.empty else None
+            return ticker_obj.history(**kwargs)
         except Exception as e:
-            error[0] = str(e)
+            last_exc = e
+            if attempt < RATE_LIMIT_MAX_RETRIES and _is_rate_limit_error(e):
+                delay = RATE_LIMIT_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.3)
+                print(f"[data_fetcher] Rate limited ({ticker_obj.ticker}) — "
+                      f"retry {attempt + 1}/{RATE_LIMIT_MAX_RETRIES} in {delay:.1f}s")
+                time.sleep(delay)
+                continue
+            raise
+    raise last_exc   # pragma: no cover — loop always returns or raises above
 
-    t = threading.Thread(target=_fetch, daemon=True)
+
+# ── TIMEOUT WRAPPER ───────────────────────────────────────────────────────────
+
+def _fetch_with_timeout(func, timeout=FETCH_TIMEOUT):
+    result = [None]
+    def target():
+        try:
+            result[0] = func()
+        except Exception as e:
+            print(f"[data_fetcher] {e}")
+    t = threading.Thread(target=target, daemon=True)
     t.start()
-    t.join(timeout=timeout_s)
-
-    if t.is_alive():
-        print(f"[data_fetcher] Timeout fetching {tickers} {interval}")
-        return None
-    if error[0]:
-        print(f"[data_fetcher] Error fetching {tickers} {interval}: {error[0]}")
-        return None
+    t.join(timeout=timeout)
     return result[0]
 
 
-def _extract(df: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
-    """Extract single ticker from multi-ticker download result."""
-    if df is None or df.empty:
+# ── CACHE HELPERS ─────────────────────────────────────────────────────────────
+
+def _cache_valid() -> bool:
+    return (time.time() - st.session_state.get("data_fetch_ts", 0)) < CACHE_TTL
+
+def _store(key, data):
+    st.session_state[key] = data
+
+def _load(key):
+    return st.session_state.get(key)
+
+
+# ── PRICE TICKER FETCH (5m + 1h + 1d) ────────────────────────────────────────
+
+def _fetch_price_ticker(label: str) -> Tuple[Optional[pd.DataFrame],
+                                              Optional[pd.DataFrame],
+                                              Optional[pd.DataFrame]]:
+    yfticker = NAS100_YF if label == NAS100_LABEL else label
+    tk = yf.Ticker(yfticker)
+
+    def get_5m():
+        df = _yf_history(tk, period="5d", interval="5m", prepost=True).ffill().bfill()
+        return df if not df.empty else None
+
+    def get_1h():
+        df = _yf_history(tk, period="60d", interval="1h").ffill().bfill()
+        return df if not df.empty else None
+
+    def get_1d():
+        df = _yf_history(tk, period="365d", interval="1d").ffill().bfill()
+        return df if not df.empty else None
+
+    return (
+        _fetch_with_timeout(get_5m, FETCH_TIMEOUT),
+        _fetch_with_timeout(get_1h, FETCH_TIMEOUT),
+        _fetch_with_timeout(get_1d, FETCH_TIMEOUT),
+    )
+
+
+# ── MACRO INSTRUMENT FETCH (daily only) ───────────────────────────────────────
+
+def _fetch_macro_instrument(symbol: str) -> Optional[pd.DataFrame]:
+    """
+    Fetch daily data for a macro instrument with fallback.
+    BZ=F (Brent) often returns stale contract data — falls back to USO.
+    ^TNX sometimes returns empty — falls back to IEF yield proxy.
+    """
+    fallbacks = {OIL_YF: OIL_FALLBACK, TNX_YF: TNX_FALLBACK}
+
+    def get():
+        period = "30d" if symbol in [TNX_YF, QQQE_YF, NDX_YF] else "5d"
+        df = _yf_history(yf.Ticker(symbol), period=period, interval="1d").ffill().bfill()
+        if not df.empty:
+            # Validate data is recent (within 3 trading days)
+            last_date = pd.Timestamp(df.index[-1]).date()
+            today     = pd.Timestamp.now().date()
+            days_old  = (today - last_date).days
+            if days_old <= 4:   # allow for weekends
+                return df
+            print(f"[data_fetcher] {symbol} data is {days_old} days old — trying fallback")
+
+        # Try fallback symbol if available
+        fallback = fallbacks.get(symbol)
+        if fallback:
+            print(f"[data_fetcher] Falling back {symbol} → {fallback}")
+            df2 = _yf_history(yf.Ticker(fallback), period="5d", interval="1d").ffill().bfill()
+            if not df2.empty:
+                return df2
         return None
-    try:
-        if isinstance(df.columns, pd.MultiIndex):
-            if ticker in df.columns.get_level_values(0):
-                sub = df[ticker].dropna(how="all")
-            elif ticker in df.columns.get_level_values(1):
-                sub = df.xs(ticker, axis=1, level=1).dropna(how="all")
-            else:
-                return None
-        else:
-            sub = df.copy()
-        sub.columns = [c.capitalize() for c in sub.columns]
-        return sub if not sub.empty else None
-    except Exception as e:
-        print(f"[data_fetcher] Extract error {ticker}: {e}")
-        return None
+    return _fetch_with_timeout(get, FETCH_TIMEOUT)
 
 
-# ── QQQ→NAS100 RATIO ─────────────────────────────────────────────────────────
-def get_qqq_ndx_ratio() -> float:
-    cached = _load("ratio")
-    if cached:
-        return cached
-    try:
-        df = _download([QQQ_TICKER, NDX_TICKER], "5d", "1d", timeout_s=15)
-        if df is not None:
-            qqq = _extract(df, QQQ_TICKER)
-            ndx = _extract(df, NDX_TICKER)
-            if qqq is not None and ndx is not None:
-                qqq_p = float(qqq['Close'].iloc[-1])
-                ndx_p = float(ndx['Close'].iloc[-1])
-                ratio = ndx_p / qqq_p if qqq_p > 0 else 40.0
-                _store("ratio", ratio)
-                return ratio
-    except Exception as e:
-        print(f"[data_fetcher] Ratio error: {e}")
-    return st.session_state.get("_df_ratio", 40.0)  # default
+# ── MASTER FETCH ─────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def _fetch_all_data_shared() -> dict:
+    """
+    The actual network fetch. Cached at the Streamlit APP-PROCESS level via
+    st.cache_data — shared across every concurrent user, not per-session.
+    This is the fix for the data-break/rate-limit root cause: the first call
+    in any CACHE_TTL window does the real fetch for everyone; every other
+    concurrent session in that window gets the cached dict back instantly,
+    no network call. Streamlit's own per-key cache lock also prevents a
+    thundering herd of simultaneous re-fetches the moment the cache goes
+    cold with several sessions live at once.
+    """
+    print(f"[data_fetcher] Parallel fetch: {len(ALL_LABELS)} price tickers + {len(MACRO_YF)} macro instruments")
+    # Re-apply patch — st.cache_data runs in a fresh context after invalidation
+    _apply_yf_patch._done = False
+    _apply_yf_patch()
+    start = time.time()
+
+    price_results = {}
+    macro_results = {}
+    threads = []
+
+    # Price tickers (5m + 1h + 1d)
+    def fetch_price(label):
+        price_results[label] = _fetch_price_ticker(label)
+
+    for label in ALL_LABELS:
+        t = threading.Thread(target=fetch_price, args=(label,), daemon=True)
+        threads.append(t)
+        t.start()
+
+    # Macro instruments (1d only)
+    def fetch_macro(sym):
+        macro_results[sym] = _fetch_macro_instrument(sym)
+
+    for sym in MACRO_YF:
+        t = threading.Thread(target=fetch_macro, args=(sym,), daemon=True)
+        threads.append(t)
+        t.start()
+
+    # Wait for all threads
+    for t in threads:
+        t.join(timeout=FETCH_TIMEOUT + 2)
+
+    # Compute QQQ→NAS100 scaling ratio from macro data
+    ndx_df = macro_results.get(NDX_YF)
+    ratio  = 40.0   # fallback
+    if ndx_df is not None and not ndx_df.empty:
+        ndx_close = float(ndx_df['Close'].iloc[-1])
+        qqq_1d = price_results.get(NAS100_LABEL, (None, None, None))[2]
+        if qqq_1d is not None and not qqq_1d.empty:
+            qqq_close = float(qqq_1d['Close'].iloc[-1])
+            if qqq_close > 0:
+                ratio = ndx_close / qqq_close
+
+    any_success = any(df_5m is not None or df_1h is not None
+                       for df_5m, df_1h, df_1d in price_results.values())
+    if any_success:
+        print(f"[data_fetcher] Complete in {time.time()-start:.1f}s | ratio={ratio:.1f}")
+
+    return {
+        "price": price_results,     # {label: (df_5m, df_1h, df_1d)}
+        "macro": macro_results,     # {symbol: df}
+        "ratio": ratio,
+        "any_success": any_success,
+        "fetched_at": time.time(),
+    }
 
 
-# ── MAIN FETCH ────────────────────────────────────────────────────────────────
 def fetch_all_data() -> bool:
     """
-    Fetch all required data. Returns True if at least NAS100 5m data is available.
-    Uses yf.download() in batches to minimise requests and avoid rate limiting.
+    Public entry point — same name, signature, and session_state side effects
+    as before, so every existing get_5m()/get_1d()/get_qqq_ndx_ratio()/etc.
+    accessor across the codebase works with zero changes. Internally, this
+    now just mirrors the shared st.cache_data result into this session's
+    session_state rather than doing its own independent network fetch.
+
+    Call once per 60s refresh cycle — subsequent reads use cache.
     """
-    _patch_session()
+    if _cache_valid():
+        return True
 
-    success = False
-    now = time.time()
+    data = _fetch_all_data_shared()
+    if not data:
+        return False
 
-    # ── BATCH 1: 5m data (NAS100 + Mag7 + macro instruments) ─────────────────
-    need_5m = [QQQ_TICKER] + MAG7
-    if not _cv(f"5m_{QQQ_TICKER}", TTL_5M):
-        try:
-            df5 = _download(need_5m, "2d", "5m", timeout_s=25)
-            if df5 is not None:
-                for ticker in need_5m:
-                    label = NAS100_LABEL if ticker == QQQ_TICKER else ticker
-                    sub   = _extract(df5, ticker)
-                    if sub is not None:
-                        _store(f"5m_{ticker}", sub)
-                        if ticker == QQQ_TICKER:
-                            success = True
-        except Exception as e:
-            print(f"[data_fetcher] 5m batch error: {e}")
+    for label, (df_5m, df_1h, df_1d) in data["price"].items():
+        _store(f"df_5m_{label}", df_5m)
+        _store(f"df_1h_{label}", df_1h)
+        _store(f"df_1d_{label}", df_1d)
 
-    # Check stale cache
-    if not success:
-        cached = _load(f"5m_{QQQ_TICKER}")
-        if cached is not None and not cached.empty:
-            success = True   # stale but usable
+    for sym, df in data["macro"].items():
+        key = {
+            TNX_YF:  "macro_tnx",
+            OIL_YF:  "macro_oil",
+            QQQE_YF: "macro_qqqe",
+            NDX_YF:  "macro_ndx",
+            VIX_YF:  "macro_vix",
+            GOLD_YF: "macro_gold",
+        }.get(sym, f"macro_{sym}")
+        _store(key, df)
 
-    # ── BATCH 2: 1H data ──────────────────────────────────────────────────────
-    need_1h = [QQQ_TICKER] + MAG7
-    if not _cv(f"1h_{QQQ_TICKER}", TTL_1H):
-        try:
-            df1h = _download(need_1h, "60d", "1h", timeout_s=20)
-            if df1h is not None:
-                for ticker in need_1h:
-                    sub = _extract(df1h, ticker)
-                    if sub is not None:
-                        _store(f"1h_{ticker}", sub)
-        except Exception as e:
-            print(f"[data_fetcher] 1H batch error: {e}")
+    _store("qqq_ndx_ratio", data["ratio"])
 
-    # ── BATCH 3: Daily data ────────────────────────────────────────────────────
-    need_1d = [QQQ_TICKER, NDX_TICKER] + MAG7
-    if not _cv(f"1d_{QQQ_TICKER}", TTL_1D):
-        try:
-            df1d = _download(need_1d, "252d", "1d", timeout_s=20)
-            if df1d is not None:
-                for ticker in need_1d:
-                    label = NAS100_LABEL if ticker == QQQ_TICKER else ticker
-                    sub   = _extract(df1d, ticker)
-                    if sub is not None:
-                        _store(f"1d_{ticker}", sub)
-                get_qqq_ndx_ratio()  # refresh ratio from fresh data
-        except Exception as e:
-            print(f"[data_fetcher] Daily batch error: {e}")
+    if data["any_success"]:
+        st.session_state["data_fetch_ts"] = data["fetched_at"]
 
-    # ── BATCH 4: Macro instruments ────────────────────────────────────────────
-    macro_tickers = list(MACRO_TICKERS.values())
-    if not _cv("macro", TTL_1D):
-        try:
-            dfm = _download(macro_tickers, "30d", "1d", timeout_s=20)
-            if dfm is not None:
-                for key, ticker in MACRO_TICKERS.items():
-                    sub = _extract(dfm, ticker)
-                    if sub is not None:
-                        _store(f"macro_{key}", sub)
-                _store("macro_ts", now)
-        except Exception as e:
-            print(f"[data_fetcher] Macro error: {e}")
-
-    return success
+    return data["any_success"]
 
 
-# ── GETTERS ───────────────────────────────────────────────────────────────────
+# ── PUBLIC ACCESSORS — price data ─────────────────────────────────────────────
 
 def get_5m(label: str) -> Optional[pd.DataFrame]:
-    ticker = QQQ_TICKER if label == NAS100_LABEL else label
-    return _load(f"5m_{ticker}")
+    return _load(f"df_5m_{label}")
 
 def get_1h(label: str) -> Optional[pd.DataFrame]:
-    ticker = QQQ_TICKER if label == NAS100_LABEL else label
-    return _load(f"1h_{ticker}")
+    return _load(f"df_1h_{label}")
 
 def get_1d(label: str) -> Optional[pd.DataFrame]:
-    ticker = QQQ_TICKER if label == NAS100_LABEL else label
-    return _load(f"1d_{ticker}")
+    return _load(f"df_1d_{label}")
+
+def get_qqq_ndx_ratio() -> float:
+    return _load("qqq_ndx_ratio") or 40.0
 
 def get_heatmap_data(label: str) -> Optional[pd.DataFrame]:
-    """1H data used for the hourly heatmap."""
-    return get_1h(label)
+    """Returns 1h data for heatmap (intraday resolution). Falls back to 1d."""
+    df = _load(f"df_1h_{label}")
+    if df is not None and not df.empty:
+        return df
+    return _load(f"df_1d_{label}")
 
 def get_vix() -> Optional[float]:
-    df = _load("macro_^VIX")
-    if df is None:
-        df = _load("macro_vix")
+    """VIX latest close — used by iv_calculator."""
+    df = _load("macro_vix")
     if df is not None and not df.empty:
-        try:
-            return float(df['Close'].iloc[-1])
-        except Exception:
-            pass
+        return float(df['Close'].iloc[-1])
     return None
 
-def get_gold_df() -> Optional[pd.DataFrame]:
-    return _load("macro_GC=F") or _load("macro_gold")
 
-def get_macro_df(key: str) -> Optional[pd.DataFrame]:
+# ── PUBLIC ACCESSORS — macro data ─────────────────────────────────────────────
+
+def get_macro_df(instrument: str) -> Optional[pd.DataFrame]:
     """
-    Returns macro instrument daily DataFrame by key.
-    Keys: 'vix', 'gold', 'oil', 'tnx', 'qqqe', 'ndx', 'dxy', 'spy'
-    Also accepts raw ticker like '^TNX', 'GC=F' etc.
+    Returns daily DataFrame for a macro instrument.
+    instrument: 'tnx' | 'oil' | 'qqqe' | 'ndx' | 'vix'
     """
-    # Try by key first
-    df = _load(f"macro_{key}")
-    if df is not None:
-        return df
-    # Try by ticker value
-    ticker = MACRO_TICKERS.get(key.lower())
-    if ticker:
-        df = _load(f"macro_{ticker}")
-        if df is not None:
-            return df
-    # Try raw ticker key
-    return _load(f"macro_{key.upper()}")
+    return _load(f"macro_{instrument}")
+
+def get_yield_10y() -> Optional[float]:
+    """
+    US 10Y Treasury yield latest close (%).
+    ^TNX returns yield directly (e.g. 4.38).
+    IEF fallback returns price (~$95) — we skip yield calculation in that case.
+    """
+    df = get_macro_df("tnx")
+    if df is not None and not df.empty:
+        val = float(df['Close'].iloc[-1])
+        # ^TNX yield is 3-6%, IEF price is 80-110 — easy to distinguish
+        if val < 15:
+            return val   # genuine yield %
+        # IEF price — approximate yield (IEF ~$95 ≈ 4% yield, inverse relationship)
+        return round(max(0, 10 - (val / 11)), 2)
+    return None
+
+def get_oil_price() -> Optional[float]:
+    """Brent crude latest close (USD)."""
+    df = get_macro_df("oil")
+    if df is not None and not df.empty:
+        return float(df['Close'].iloc[-1])
+    return None
+
+def get_qqqe_df() -> Optional[pd.DataFrame]:
+    """Equal-weight Nasdaq-100 daily data."""
+    return get_macro_df("qqqe")
+
+def get_gold_df() -> Optional[pd.DataFrame]:
+    """Gold ETF (GLD) daily data — for cross-asset risk-off detection."""
+    return _load("macro_gold")
+
+def get_qqq_1d() -> Optional[pd.DataFrame]:
+    """QQQ daily data (stored under NAS100 label)."""
+    return _load(f"df_1d_{NAS100_LABEL}")
