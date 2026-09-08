@@ -1,14 +1,13 @@
-# ── CRITICAL: yfinance must be pinned to latest ──────────────────────────────
-# Yahoo Finance broke older yfinance in 2025 with TLS fingerprinting.
-# yfinance 0.2.37+ uses curl_cffi to bypass this. DO NOT use plain "yfinance".
-# If you see "data frozen" errors, delete and redeploy the app entirely.
-yfinance==0.2.40
-curl_cffi==0.7.0
+# ── yfinance ──────────────────────────────────────────────────────────────────
+# 0.2.66 is the last 0.2.x before the v1.x breaking changes
+# Works with Yahoo cookie injection (see data_fetcher.py _build_yahoo_session)
+yfinance==0.2.66
 
-# ── Core data / math ─────────────────────────────────────────────────────────
+# ── Core ──────────────────────────────────────────────────────────────────────
 pandas>=2.0.0
 numpy>=1.24.0
 scipy>=1.10.0
+requests>=2.31.0
 
 # ── Streamlit ─────────────────────────────────────────────────────────────────
 streamlit>=1.35.0
@@ -17,8 +16,7 @@ streamlit-autorefresh>=1.0.1
 # ── Claude API ────────────────────────────────────────────────────────────────
 anthropic>=0.25.0
 
-# ── yfinance hard dependencies (explicit to prevent version conflicts) ────────
-requests>=2.31.0
+# ── yfinance dependencies ─────────────────────────────────────────────────────
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
 peewee>=3.17.0
@@ -27,5 +25,4 @@ multitasking>=0.0.11
 protobuf>=4.21.0
 websockets>=11.0
 
-# ── NOT for Streamlit Cloud ───────────────────────────────────────────────────
-# MetaTrader5   # Windows-only
+# MetaTrader5   # Windows-only — do not uncomment on Streamlit Cloud
