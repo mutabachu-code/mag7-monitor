@@ -46,64 +46,6 @@ import random
 import streamlit as st
 import threading
 from typing import Optional, Tuple
-import os
-import shutil
-
-
-# ── YFINANCE SESSION PATCH ────────────────────────────────────────────────────
-# Yahoo Finance added TLS fingerprinting in 2025 that blocks cloud server IPs.
-# curl_cffi mimics Chrome's TLS handshake, bypassing the block.
-# Also clears yfinance's SQLite price cache which can serve stale bars.
-
-def _apply_yf_patch():
-    """Apply once per Python process. Safe to call multiple times."""
-    if getattr(_apply_yf_patch, "_done", False):
-        return
-    try:
-        # 1. Clear stale SQLite price cache
-        try:
-            from platformdirs import user_cache_dir
-            cache_dir = user_cache_dir("py-yfinance")
-            if os.path.exists(cache_dir):
-                shutil.rmtree(cache_dir, ignore_errors=True)
-                os.makedirs(cache_dir, exist_ok=True)
-                print("[data_fetcher] Cleared yfinance SQLite cache")
-        except Exception:
-            pass
-
-        # 2. curl_cffi Chrome impersonation (best fix for cloud TLS block)
-        try:
-            from curl_cffi import requests as cffi_req
-            _s = cffi_req.Session(impersonate="chrome110")
-            yf.utils.get_json.__globals__['requests'] = _s
-            print("[data_fetcher] curl_cffi session applied")
-        except ImportError:
-            # curl_cffi not installed — fall back to requests with browser headers
-            import requests
-            _s = requests.Session()
-            _s.headers.update({
-                'User-Agent': (
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/120.0.0.0 Safari/537.36'
-                ),
-                'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Connection': 'keep-alive',
-            })
-            print("[data_fetcher] requests session with browser headers applied")
-        except Exception:
-            pass
-
-        _apply_yf_patch._done = True
-        print("[data_fetcher] yfinance patch complete")
-    except Exception as e:
-        print(f"[data_fetcher] Patch error (non-fatal): {e}")
-        _apply_yf_patch._done = True
-
-
-# Apply immediately on import (before any yfinance call)
-_apply_yf_patch()
 
 # ── INSTRUMENT REGISTRY ───────────────────────────────────────────────────────
 MAG7         = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA']
@@ -192,23 +134,64 @@ def _load(key):
 
 # ── PRICE TICKER FETCH (5m + 1h + 1d) ────────────────────────────────────────
 
+def _download_df(ticker: str, period: str, interval: str) -> "Optional[pd.DataFrame]":
+    """
+    Use yf.download() instead of yf.Ticker().history().
+    yf.download() uses a different Yahoo Finance endpoint that bypasses
+    the consent wall blocking .history() on cloud servers.
+    This is the definitive fix for 'No market data available' on Streamlit Cloud.
+    """
+    try:
+        df = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
+        if df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df.columns = [c.capitalize() for c in df.columns]
+        df = df.ffill().bfill()
+        return df if not df.empty else None
+    except Exception as e:
+        print(f"[data_fetcher] download {ticker} {interval}: {e}")
+        return None
+
+
 def _fetch_price_ticker(label: str) -> Tuple[Optional[pd.DataFrame],
                                               Optional[pd.DataFrame],
                                               Optional[pd.DataFrame]]:
     yfticker = NAS100_YF if label == NAS100_LABEL else label
-    tk = yf.Ticker(yfticker)
 
     def get_5m():
-        df = _yf_history(tk, period="5d", interval="5m", prepost=True).ffill().bfill()
-        return df if not df.empty else None
+        # Try yf.download() first (bypasses consent wall)
+        df = _download_df(yfticker, "5d", "5m")
+        if df is not None:
+            return df
+        # Fallback: yf.Ticker().history() with retry
+        tk = yf.Ticker(yfticker)
+        result = _yf_history(tk, period="5d", interval="5m", prepost=True)
+        return result.ffill().bfill() if not result.empty else None
 
     def get_1h():
-        df = _yf_history(tk, period="60d", interval="1h").ffill().bfill()
-        return df if not df.empty else None
+        df = _download_df(yfticker, "60d", "1h")
+        if df is not None:
+            return df
+        tk = yf.Ticker(yfticker)
+        result = _yf_history(tk, period="60d", interval="1h")
+        return result.ffill().bfill() if not result.empty else None
 
     def get_1d():
-        df = _yf_history(tk, period="365d", interval="1d").ffill().bfill()
-        return df if not df.empty else None
+        df = _download_df(yfticker, "365d", "1d")
+        if df is not None:
+            return df
+        tk = yf.Ticker(yfticker)
+        result = _yf_history(tk, period="365d", interval="1d")
+        return result.ffill().bfill() if not result.empty else None
 
     return (
         _fetch_with_timeout(get_5m, FETCH_TIMEOUT),
@@ -229,23 +212,30 @@ def _fetch_macro_instrument(symbol: str) -> Optional[pd.DataFrame]:
 
     def get():
         period = "30d" if symbol in [TNX_YF, QQQE_YF, NDX_YF] else "5d"
-        df = _yf_history(yf.Ticker(symbol), period=period, interval="1d").ffill().bfill()
-        if not df.empty:
-            # Validate data is recent (within 3 trading days)
+        # Try yf.download() first (bypasses consent wall)
+        df = _download_df(symbol, period, "1d")
+        if df is not None and not df.empty:
             last_date = pd.Timestamp(df.index[-1]).date()
-            today     = pd.Timestamp.now().date()
-            days_old  = (today - last_date).days
-            if days_old <= 4:   # allow for weekends
+            days_old  = (pd.Timestamp.now().date() - last_date).days
+            if days_old <= 4:
                 return df
             print(f"[data_fetcher] {symbol} data is {days_old} days old — trying fallback")
 
-        # Try fallback symbol if available
+        # Fallback 1: yf.Ticker().history()
+        try:
+            df2 = _yf_history(yf.Ticker(symbol), period=period, interval="1d").ffill().bfill()
+            if not df2.empty:
+                return df2
+        except Exception:
+            pass
+
+        # Fallback 2: alternative symbol
         fallback = fallbacks.get(symbol)
         if fallback:
             print(f"[data_fetcher] Falling back {symbol} → {fallback}")
-            df2 = _yf_history(yf.Ticker(fallback), period="5d", interval="1d").ffill().bfill()
-            if not df2.empty:
-                return df2
+            df3 = _download_df(fallback, "5d", "1d")
+            if df3 is not None and not df3.empty:
+                return df3
         return None
     return _fetch_with_timeout(get, FETCH_TIMEOUT)
 
@@ -265,9 +255,6 @@ def _fetch_all_data_shared() -> dict:
     cold with several sessions live at once.
     """
     print(f"[data_fetcher] Parallel fetch: {len(ALL_LABELS)} price tickers + {len(MACRO_YF)} macro instruments")
-    # Re-apply patch — st.cache_data runs in a fresh context after invalidation
-    _apply_yf_patch._done = False
-    _apply_yf_patch()
     start = time.time()
 
     price_results = {}
