@@ -3,6 +3,13 @@ import pandas as pd
 import numpy as np
 from scipy.stats import norm
 from streamlit_autorefresh import st_autorefresh
+
+# ── YFINANCE SESSION PATCH (must be before any yfinance import) ───────────────
+# Fixes Yahoo Finance rate-limiting / cookie issues causing stale data on Streamlit Cloud
+try:
+    import data_fetcher_patch   # noqa — applies patch on import
+except Exception as _patch_err:
+    pass   # non-fatal — app continues without patch
 from datetime import datetime, timezone
 
 from data_fetcher import fetch_all_data, get_5m, get_1h, get_1d, get_vix, get_heatmap_data, get_qqq_ndx_ratio, get_gold_df, get_macro_df, MAG7
@@ -44,6 +51,27 @@ risk_config = RiskConfig(
     max_trades_per_day=3,
 )
 risk_config = render_risk_sidebar(risk_config)
+
+# ── FORCE REFRESH BUTTON (nuclear cache clear) ────────────────────────────────
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("**🔄 Data Controls**")
+    if st.button("🔴 Force Full Refresh", help="Clears all cached data and forces a fresh fetch from Yahoo Finance"):
+        # Clear ALL session state cache keys
+        keys_to_clear = [k for k in list(st.session_state.keys())
+                         if any(k.startswith(p) for p in
+                                ['df_5m_', 'df_1h_', 'df_1d_', 'oi_', 'gex_',
+                                 'expected_move', 'nq_', 'qqq_', 'ii_', 'nas100_',
+                                 'breadth_', 'master_', 'regime_', '_yf_',
+                                 'last_good_fetch'])]
+        for k in keys_to_clear:
+            del st.session_state[k]
+        # Re-apply patch with fresh session
+        if '_yf_patched_v3' in st.session_state:
+            del st.session_state['_yf_patched_v3']
+        st.success(f"✅ Cleared {len(keys_to_clear)} cache keys. Refreshing...")
+        st.rerun()
+    st.caption("Use if price shows as frozen or very old")
 
 st.title("🛡️ Mag 7 + NAS100 MTF Monitor + Claude AI")
 st.caption(
