@@ -4,40 +4,7 @@ import numpy as np
 from scipy.stats import norm
 from streamlit_autorefresh import st_autorefresh
 
-# ── YFINANCE SESSION PATCH ────────────────────────────────────────────────────
-# Fixes Yahoo Finance TLS/cookie blocking that causes "3564min old data" freeze.
-# Applied once per session before any yfinance call.
-def _apply_yf_patch():
-    _key = "_yf_patched_v3"
-    if st.session_state.get(_key):
-        return
-    try:
-        import os, shutil, yfinance as yf
-
-        # 1. Clear yfinance SQLite price cache (main cause of stale data)
-        try:
-            from platformdirs import user_cache_dir
-            cache_dir = user_cache_dir("py-yfinance")
-            if os.path.exists(cache_dir):
-                shutil.rmtree(cache_dir, ignore_errors=True)
-                os.makedirs(cache_dir, exist_ok=True)
-        except Exception:
-            pass
-
-        # 2. Try curl_cffi impersonation (bypasses Yahoo TLS fingerprinting)
-        try:
-            from curl_cffi import requests as cffi_req
-            _session = cffi_req.Session(impersonate="chrome110")
-            yf.utils.get_json.__globals__['requests'] = _session
-        except Exception:
-            pass
-
-        st.session_state[_key] = True
-    except Exception as _e:
-        st.session_state["_yf_patched_v3"] = True  # don't retry
-
-_apply_yf_patch()
-
+# data_fetcher.py handles its own yfinance session patching on import
 from datetime import datetime, timezone
 
 from data_fetcher import fetch_all_data, get_5m, get_1h, get_1d, get_vix, get_heatmap_data, get_qqq_ndx_ratio, get_gold_df, get_macro_df, MAG7
