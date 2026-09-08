@@ -45,7 +45,75 @@ import time
 import random
 import streamlit as st
 import threading
+import requests
 from typing import Optional, Tuple
+
+
+# ── YAHOO FINANCE COOKIE BYPASS ───────────────────────────────────────────────
+# Yahoo Finance broke the crumb/consent system in Sep 2026 for cloud server IPs.
+# Fix: inject a real browser cookie from Streamlit Secrets into yfinance session.
+#
+# HOW TO SET UP (one-time, takes 2 minutes):
+#   1. Open https://finance.yahoo.com in Chrome/Edge
+#   2. Press F12 → Network tab → reload the page
+#   3. Click any request to finance.yahoo.com → Headers → Request Headers
+#   4. Find the "cookie:" header → copy the ENTIRE value
+#   5. In Streamlit Cloud → App settings → Secrets → add:
+#      YAHOO_COOKIE = "your_cookie_value_here"
+#   6. Also copy the "user-agent:" value and add:
+#      YAHOO_UA = "Mozilla/5.0 ..."
+#   Cookies last ~7 days — update in Secrets when app breaks again.
+
+def _build_yahoo_session() -> requests.Session:
+    """Build a requests session with Yahoo Finance browser cookies."""
+    session = requests.Session()
+
+    # Default headers that work without a cookie (fallback)
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+
+    # Inject cookie from Streamlit Secrets if available
+    try:
+        cookie_val = st.secrets.get("YAHOO_COOKIE", "")
+        ua_val     = st.secrets.get("YAHOO_UA", "")
+        if cookie_val:
+            session.headers["Cookie"] = cookie_val
+            print("[data_fetcher] Yahoo cookie from Secrets injected ✅")
+        if ua_val:
+            session.headers["User-Agent"] = ua_val
+    except Exception:
+        pass   # secrets not configured — use default headers
+
+    return session
+
+
+def _patch_yfinance_session(session: requests.Session):
+    """Inject our authenticated session into yfinance internals."""
+    try:
+        # yfinance 0.2.x
+        yf.utils.get_json.__globals__['requests'] = session
+    except Exception:
+        pass
+    try:
+        # yfinance 1.x
+        import yfinance.data as _yfd
+        _yfd.YfData._session = session
+    except Exception:
+        pass
+
+
+# Apply once on import
+_YF_SESSION = _build_yahoo_session()
+_patch_yfinance_session(_YF_SESSION)
 
 # ── INSTRUMENT REGISTRY ───────────────────────────────────────────────────────
 MAG7         = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA']
@@ -134,64 +202,23 @@ def _load(key):
 
 # ── PRICE TICKER FETCH (5m + 1h + 1d) ────────────────────────────────────────
 
-def _download_df(ticker: str, period: str, interval: str) -> "Optional[pd.DataFrame]":
-    """
-    Use yf.download() instead of yf.Ticker().history().
-    yf.download() uses a different Yahoo Finance endpoint that bypasses
-    the consent wall blocking .history() on cloud servers.
-    This is the definitive fix for 'No market data available' on Streamlit Cloud.
-    """
-    try:
-        df = yf.download(
-            ticker,
-            period=period,
-            interval=interval,
-            auto_adjust=True,
-            progress=False,
-            threads=False,
-        )
-        if df.empty:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.columns = [c.capitalize() for c in df.columns]
-        df = df.ffill().bfill()
-        return df if not df.empty else None
-    except Exception as e:
-        print(f"[data_fetcher] download {ticker} {interval}: {e}")
-        return None
-
-
 def _fetch_price_ticker(label: str) -> Tuple[Optional[pd.DataFrame],
                                               Optional[pd.DataFrame],
                                               Optional[pd.DataFrame]]:
     yfticker = NAS100_YF if label == NAS100_LABEL else label
+    tk = yf.Ticker(yfticker)
 
     def get_5m():
-        # Try yf.download() first (bypasses consent wall)
-        df = _download_df(yfticker, "5d", "5m")
-        if df is not None:
-            return df
-        # Fallback: yf.Ticker().history() with retry
-        tk = yf.Ticker(yfticker)
-        result = _yf_history(tk, period="5d", interval="5m", prepost=True)
-        return result.ffill().bfill() if not result.empty else None
+        df = _yf_history(tk, period="5d", interval="5m", prepost=True).ffill().bfill()
+        return df if not df.empty else None
 
     def get_1h():
-        df = _download_df(yfticker, "60d", "1h")
-        if df is not None:
-            return df
-        tk = yf.Ticker(yfticker)
-        result = _yf_history(tk, period="60d", interval="1h")
-        return result.ffill().bfill() if not result.empty else None
+        df = _yf_history(tk, period="60d", interval="1h").ffill().bfill()
+        return df if not df.empty else None
 
     def get_1d():
-        df = _download_df(yfticker, "365d", "1d")
-        if df is not None:
-            return df
-        tk = yf.Ticker(yfticker)
-        result = _yf_history(tk, period="365d", interval="1d")
-        return result.ffill().bfill() if not result.empty else None
+        df = _yf_history(tk, period="365d", interval="1d").ffill().bfill()
+        return df if not df.empty else None
 
     return (
         _fetch_with_timeout(get_5m, FETCH_TIMEOUT),
@@ -212,30 +239,23 @@ def _fetch_macro_instrument(symbol: str) -> Optional[pd.DataFrame]:
 
     def get():
         period = "30d" if symbol in [TNX_YF, QQQE_YF, NDX_YF] else "5d"
-        # Try yf.download() first (bypasses consent wall)
-        df = _download_df(symbol, period, "1d")
-        if df is not None and not df.empty:
+        df = _yf_history(yf.Ticker(symbol), period=period, interval="1d").ffill().bfill()
+        if not df.empty:
+            # Validate data is recent (within 3 trading days)
             last_date = pd.Timestamp(df.index[-1]).date()
-            days_old  = (pd.Timestamp.now().date() - last_date).days
-            if days_old <= 4:
+            today     = pd.Timestamp.now().date()
+            days_old  = (today - last_date).days
+            if days_old <= 4:   # allow for weekends
                 return df
             print(f"[data_fetcher] {symbol} data is {days_old} days old — trying fallback")
 
-        # Fallback 1: yf.Ticker().history()
-        try:
-            df2 = _yf_history(yf.Ticker(symbol), period=period, interval="1d").ffill().bfill()
-            if not df2.empty:
-                return df2
-        except Exception:
-            pass
-
-        # Fallback 2: alternative symbol
+        # Try fallback symbol if available
         fallback = fallbacks.get(symbol)
         if fallback:
             print(f"[data_fetcher] Falling back {symbol} → {fallback}")
-            df3 = _download_df(fallback, "5d", "1d")
-            if df3 is not None and not df3.empty:
-                return df3
+            df2 = _yf_history(yf.Ticker(fallback), period="5d", interval="1d").ffill().bfill()
+            if not df2.empty:
+                return df2
         return None
     return _fetch_with_timeout(get, FETCH_TIMEOUT)
 
@@ -255,6 +275,8 @@ def _fetch_all_data_shared() -> dict:
     cold with several sessions live at once.
     """
     print(f"[data_fetcher] Parallel fetch: {len(ALL_LABELS)} price tickers + {len(MACRO_YF)} macro instruments")
+    # Re-patch session after cache invalidation
+    _patch_yfinance_session(_YF_SESSION)
     start = time.time()
 
     price_results = {}
