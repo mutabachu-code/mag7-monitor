@@ -703,11 +703,6 @@ if _nas_5m_early is not None and nas_ind:
             _nas_1d_early if _nas_1d_early is not None else _nas_5m_early,
             float(nas_ind['curr_p']),
             qqq_to_nas100_ratio=_nas_ratio_ms,
-            expected_move_pts=(_em_ms.expected_daily_move_pts if _em_ms else float(nas_ind['curr_p']) * 0.012),
-            actual_move_pts=(_em_ms.actual_move_today_pts if _em_ms else 0.0),
-            regime_state=(_global_regime.state if _global_regime else 0),
-            gex_regime=(_gex_ms.gamma_regime if _gex_ms else "NEGATIVE"),
-            rsi=float(nas_ind.get('rsi', 50)),
         )
     except Exception:
         pass
@@ -894,27 +889,6 @@ if nas_ind:
     st.divider()
 
 # ── NAS100 SCALPING PANEL ─────────────────────────────────────────────────────
-# ── ORDER FLOW SEQUENCE PANEL ───────────────────────────────────────────────
-if _nas_5m is not None and nas_ind and _scalp_for_ms:
-    try:
-        _gex_regime_ofs = _gex_ms.gamma_regime if _gex_ms else "NEGATIVE"
-        _regime_state_ofs = _global_regime.state if _global_regime else 0
-        _regime_label_ofs = ("CHOP" if _regime_state_ofs == 1 else
-                             "CRISIS" if _regime_state_ofs == 2 else "TRENDING")
-        _ofs = compute_order_flow_sequence(
-            df_5m         = get_5m(NAS100_LABEL),
-            scalp_report  = _scalp_for_ms,
-            current_price = float(nas_ind["curr_p"]),
-            ratio         = float(get_qqq_ndx_ratio() or 40.0),
-            gex_regime    = _gex_regime_ofs,
-            regime_state  = _regime_state_ofs,
-            regime_label  = _regime_label_ofs,
-        )
-        render_order_flow_sequence(_ofs)
-    except Exception as _ofs_err:
-        st.warning(f"Order flow sequence error: {_ofs_err}")
-
-st.divider()
 st.subheader("🎯 NAS100 Sniper Scalping")
 _nas_5m = get_5m(NAS100_LABEL)
 _nas_1d = get_1d(NAS100_LABEL)
@@ -1142,163 +1116,32 @@ if _nas_5m is not None and nas_ind:
                 else:
                     st.caption("No active CPR signal at current price.")
 
-        # ── ORDER FLOW PANEL ──────────────────────────────────────────────────
-        st.markdown("---")
-        st.markdown("### 🏦 Institutional Order Flow")
-        if _nas_scalp.order_flow:
-            of = _nas_scalp.order_flow
-            # Main signal banner
-            st.markdown(
-                f"<div style='padding:10px 14px;border-radius:8px;"
-                f"background:{of.flow_color}22;border:2px solid {of.flow_color}'>"
-                f"<span style='color:{of.flow_color};font-size:1.1em;font-weight:bold'>"
-                f"{of.flow_signal}</span></div>",
-                unsafe_allow_html=True,
-            )
-
-            # Metrics row
-            of1, of2, of3, of4, of5 = st.columns(5)
-            of1.metric("Buy Vol", f"{of.buy_vol_today/1e6:.1f}M")
-            of2.metric("Sell Vol", f"{of.sell_vol_today/1e6:.1f}M")
-            delta_c = "normal" if of.delta_pct >= 0 else "inverse"
-            of3.metric("Delta", f"{of.delta_pct:+.1f}%",
-                       delta=of.delta_trend, delta_color=delta_c)
-            of4.metric("Vol Pace", f"{of.vol_pace_ratio:.2f}×",
-                       delta=of.vol_signal)
-            of5.metric("Vol Accel", f"{of.vol_acceleration:.2f}×",
-                       delta="↑ Building" if of.vol_acceleration > 1.2
-                             else "↓ Fading" if of.vol_acceleration < 0.8
-                             else "Steady")
-
-            # Aggression + Absorption row
-            agg_col1, agg_col2 = st.columns(2)
-            with agg_col1:
-                agg_color = ("#2d9e2d" if "BUYER" in of.aggression
-                             else "#c9302c" if "SELLER" in of.aggression
-                             else "#888")
-                st.markdown(
-                    f"**⚡ Aggression:** "
-                    f"<span style='color:{agg_color};font-weight:bold'>"
-                    f"{of.aggression} ({of.aggression_score:+.0f}/100)</span>",
-                    unsafe_allow_html=True,
-                )
-            with agg_col2:
-                if of.absorption_detected:
-                    abs_c = "#2d9e2d" if "SELLERS" in of.absorption_side else "#c9302c"
-                    st.markdown(
-                        f"**🧲 Absorption:** "
-                        f"<span style='color:{abs_c};font-weight:bold'>"
-                        f"{of.absorption_side}</span>",
-                        unsafe_allow_html=True,
-                    )
-                    st.caption(of.absorption_note)
-
-            # Institutional bar
-            if of.inst_bar_detected:
-                inst_c = "#2d9e2d" if "BULLISH" in of.inst_bar_direction else "#c9302c"
-                st.markdown(
-                    f"<div style='padding:6px 10px;border-radius:5px;"
-                    f"background:{inst_c}22;border-left:3px solid {inst_c};margin-top:6px'>"
-                    f"<span style='color:{inst_c};font-weight:bold'>"
-                    f"🏛️ INSTITUTIONAL PRINT: {of.inst_bar_direction}</span><br>"
-                    f"<span style='color:#ccc;font-size:0.88em'>{of.inst_bar_note}</span>"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-
-            # Cumulative delta mini chart
-            if of.cumulative_delta:
-                cd_df = pd.DataFrame({"Cumulative Delta": of.cumulative_delta})
-                st.line_chart(cd_df, height=80)
-        else:
-            st.caption("Order flow unavailable (insufficient data)")
-
-        # ── MEAN REVERSION PANEL ──────────────────────────────────────────────
-        st.markdown("---")
-        st.markdown("### 🔄 Mean Reversion Setup")
-        if _nas_scalp.mean_reversion and _nas_scalp.mean_reversion.active:
-            mr = _nas_scalp.mean_reversion
-            mr_col = "#2d9e2d" if mr.direction == "LONG" else "#c9302c"
-            conv_col = {"HIGH": "#2d9e2d", "MODERATE": "#e6a817", "LOW": "#888"}.get(mr.conviction, "#888")
-
-            # Main signal card
-            st.markdown(
-                f"<div style='padding:12px;border-radius:10px;"
-                f"background:{mr_col}22;border:2px solid {mr_col}'>"
-                f"<div style='font-size:1.2em;font-weight:bold;color:{mr_col}'>"
-                f"{'📈 FADE LONG' if mr.direction == 'LONG' else '📉 FADE SHORT'} "
-                f"— {mr.conviction} CONVICTION</div>"
-                f"<div style='margin-top:4px;color:#ccc;font-size:0.9em'>"
-                f"Trigger: {mr.trigger}</div>"
-                f"<div style='margin-top:4px;color:{conv_col};font-size:0.88em'>"
-                f"🎯 {mr.win_rate_estimate}</div>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-
-            # Trade levels
-            ml1, ml2, ml3, ml4, ml5 = st.columns(5)
-            ml1.markdown(
-                f"<div style='background:#1a2a1a;padding:8px;border-radius:6px;text-align:center;"
-                f"border:1px solid {mr_col}'>"
-                f"<div style='color:#aaa;font-size:0.75em'>ENTRY ZONE</div>"
-                f"<div style='color:{mr_col};font-weight:bold'>"
-                f"{mr.entry_zone_low:,.0f}–{mr.entry_zone_high:,.0f}</div></div>",
-                unsafe_allow_html=True,
-            )
-            ml2.markdown(
-                f"<div style='background:#2a1a1a;padding:8px;border-radius:6px;text-align:center;"
-                f"border:1px solid #c9302c'>"
-                f"<div style='color:#aaa;font-size:0.75em'>STOP</div>"
-                f"<div style='color:#c9302c;font-weight:bold'>{mr.stop_loss:,.0f}</div>"
-                f"<div style='color:#888;font-size:0.7em'>{mr.risk_pts:.0f} pts</div></div>",
-                unsafe_allow_html=True,
-            )
-            ml3.markdown(
-                f"<div style='background:#2a2a1a;padding:8px;border-radius:6px;text-align:center;"
-                f"border:1px solid #aa44ff'>"
-                f"<div style='color:#aaa;font-size:0.75em'>TARGET</div>"
-                f"<div style='color:#aa44ff;font-weight:bold'>{mr.reversion_target:,.0f}</div>"
-                f"<div style='color:#888;font-size:0.7em'>VWAP/Pivot</div></div>",
-                unsafe_allow_html=True,
-            )
-            ml4.markdown(
-                f"<div style='background:#1a2a1a;padding:8px;border-radius:6px;text-align:center;"
-                f"border:1px solid #5cb85c'>"
-                f"<div style='color:#aaa;font-size:0.75em'>TP1</div>"
-                f"<div style='color:#5cb85c;font-weight:bold'>{mr.take_profit_1:,.0f}</div>"
-                f"<div style='color:#888;font-size:0.7em'>{mr.rr_ratio:.1f}:1</div></div>",
-                unsafe_allow_html=True,
-            )
-            ml5.markdown(
-                f"<div style='background:#1a2a1a;padding:8px;border-radius:6px;text-align:center;"
-                f"border:1px solid #2d9e2d'>"
-                f"<div style='color:#aaa;font-size:0.75em'>TP2</div>"
-                f"<div style='color:#2d9e2d;font-weight:bold'>{mr.take_profit_2:,.0f}</div></div>",
-                unsafe_allow_html=True,
-            )
-
-            # Context metrics
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            mc1.metric("VWAP Dev",    f"{mr.vwap_dev_pct:+.2f}%")
-            mc2.metric("EM Used",     f"{mr.expected_move_pct_used:.0f}%",
-                       delta="Exhausted" if mr.expected_move_pct_used > 80 else "")
-            mc3.metric("Vol Confirms", "✅ YES" if mr.volume_confirms else "⚠️ NO")
-            mc4.metric("GEX Fade",    "✅ YES" if mr.gex_confirms else "⚠️ NO")
-
-            # Conviction factors
-            with st.expander("📋 Conviction Factors", expanded=False):
-                for factor in mr.conviction_factors:
-                    st.markdown(f"✅ {factor}")
-                st.caption(f"❌ Invalidation: {mr.invalidation_note}")
-        else:
-            st.info("No mean reversion setup active — price within normal VWAP range "
-                    "or insufficient confirmation factors.")
-
     except Exception as _se:
         st.warning(f"NAS100 scalping unavailable: {_se}")
 else:
     st.caption("NAS100 data not yet loaded.")
+
+st.divider()
+
+# ── ORDER FLOW SEQUENCE ───────────────────────────────────────────────────────
+if _nas_5m is not None and nas_ind and _scalp_for_ms:
+    try:
+        _gex_regime_ofs   = _gex_ms.gamma_regime if _gex_ms else "NEGATIVE"
+        _regime_state_ofs = _global_regime.state if _global_regime else 0
+        _regime_label_ofs = ("CHOP"    if _regime_state_ofs == 1 else
+                             "CRISIS"  if _regime_state_ofs == 2 else "TRENDING")
+        _ofs = compute_order_flow_sequence(
+            df_5m         = _nas_5m,
+            scalp_report  = _scalp_for_ms,
+            current_price = float(nas_ind["curr_p"]),
+            ratio         = float(get_qqq_ndx_ratio() or 40.0),
+            gex_regime    = _gex_regime_ofs,
+            regime_state  = _regime_state_ofs,
+            regime_label  = _regime_label_ofs,
+        )
+        render_order_flow_sequence(_ofs)
+    except Exception as _ofs_err:
+        st.warning(f"Order flow sequence: {_ofs_err}")
 
 st.divider()
 
